@@ -22,10 +22,10 @@ from .models import PositionState, RuntimeState
 from .order_manager import FillResult, OrderManager
 from .portfolio import apply_fill_to_state, apply_funding_to_state, mark_to_market_unrealized_pnl
 from .analytics import PerformanceAnalytics
+from .decision_policy import DecisionInput, ExpectancyDecisionPolicy, TradeDecision
 from .profit_controls import (
     AdverseSelectionGuard,
     ExecutionQualityMonitor,
-    NetEdgeGate,
     RegimeDetector,
     build_pnl_attribution,
 )
@@ -105,7 +105,13 @@ class Bot:
         self._current_regime: str = "unknown"
         self._liquidation_mode: bool = False
         self.regime_detector = RegimeDetector(lookback=int(os.getenv("REGIME_LOOKBACK_TICKS", "40")))
-        self.edge_gate = NetEdgeGate(min_net_edge_bps=float(os.getenv("MIN_NET_EDGE_BPS", "12.0")))
+        self.decision_policy = ExpectancyDecisionPolicy(
+            base_threshold_bps=float(os.getenv("MIN_NET_EDGE_BPS", "0.20")),
+            confidence_margin_bps=float(os.getenv("EXPECTANCY_CONF_MARGIN_BPS", "0.15")),
+            toxicity_penalty_bps=float(os.getenv("EXPECTANCY_TOXICITY_PENALTY_BPS", "0.30")),
+            inventory_penalty_factor=float(os.getenv("EXPECTANCY_INVENTORY_PENALTY", "0.25")),
+            min_confidence=float(os.getenv("EXPECTANCY_MIN_CONFIDENCE", "0.20")),
+        )
         self.adverse_guard = AdverseSelectionGuard(
             move_bps_threshold=float(os.getenv("ADVERSE_MOVE_BPS", "4.0")),
             cooldown_seconds=int(os.getenv("ADVERSE_COOLDOWN_SECONDS", "2")),
@@ -142,6 +148,10 @@ class Bot:
         )
         self._last_dashboard_at: datetime | None = None
         self._last_restart_request_at: datetime | None = None
+        self._order_decisions: dict[str, dict] = {}
+        self._pending_decision_context: dict | None = None
+        self._last_decision: TradeDecision | None = None
+        self._last_decision_context: dict = {}
 
         self._running = True
         signal.signal(signal.SIGINT, self._stop)
@@ -172,6 +182,7 @@ class Bot:
 
     def _apply_fill(self, fill: FillResult) -> None:
         now = datetime.now(timezone.utc)
+        decision_ctx = self._order_decisions.pop(fill.client_order_id, self._last_decision_context)
         impact = apply_fill_to_state(
             self.state,
             side=fill.side,
@@ -215,6 +226,32 @@ class Bot:
         )
         self.exec_quality.on_fill(impact.slippage_usd)
 
+        notional = max(fill.qty * fill.price, 1e-9)
+        realized_net_bps = ((impact.realized_pnl_usd - impact.fee_usd - impact.slippage_usd) / notional) * 10000.0
+        fee_bps = (impact.fee_usd / notional) * 10000.0
+        slippage_bps = (impact.slippage_usd / notional) * 10000.0
+        expected_net_bps = float(decision_ctx.get("expected_net_bps", 0.0)) if isinstance(decision_ctx, dict) else 0.0
+        confidence = float(decision_ctx.get("confidence", 0.0)) if isinstance(decision_ctx, dict) else 0.0
+        adverse_bps = float(decision_ctx.get("adverse_selection_bps", 0.0)) if isinstance(decision_ctx, dict) else 0.0
+        expected_fill_prob = float(decision_ctx.get("fill_prob", 0.0)) if isinstance(decision_ctx, dict) else 0.0
+        threshold_used = float(decision_ctx.get("threshold_used", 0.0)) if isinstance(decision_ctx, dict) else 0.0
+
+        self._log_event(
+            "edge_realization",
+            {
+                "order_id": fill.order_id,
+                "client_order_id": fill.client_order_id,
+                "predicted_net_bps": expected_net_bps,
+                "realized_net_bps": realized_net_bps,
+                "confidence": confidence,
+                "threshold_used": threshold_used,
+                "fee_bps": fee_bps,
+                "slippage_bps": slippage_bps,
+                "adverse_selection_bps": adverse_bps,
+                "expected_fill_prob": expected_fill_prob,
+            },
+        )
+
         attribution = build_pnl_attribution(
             realized_usd=impact.realized_pnl_usd,
             fees_usd=impact.fee_usd,
@@ -257,6 +294,13 @@ class Bot:
             vol_bps=self._last_ms.vol_bps if self._last_ms else 0.0,
             queue_position=self._last_ms.queue_position if self._last_ms else "unknown",
             side=fill.side,
+            expected_net_bps=expected_net_bps,
+            realized_net_bps=realized_net_bps,
+            confidence=confidence,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            adverse_selection_bps=adverse_bps,
+            expected_fill_prob=expected_fill_prob,
         )
         self._last_fill_side = fill.side
         self._last_fill_price = fill.price
@@ -385,6 +429,13 @@ class Bot:
             "liquidation_mode": self._liquidation_mode,
             "calibrator_gamma": self.calibrator.as_gamma,
             "calibrator_edge_bps": self.calibrator.min_net_edge_bps,
+            "decision_should_trade": self._last_decision.should_trade if self._last_decision else False,
+            "decision_expected_net_bps": self._last_decision.expected_net_bps if self._last_decision else 0.0,
+            "decision_confidence": self._last_decision.confidence if self._last_decision else 0.0,
+            "decision_threshold_used": self._last_decision.threshold_used if self._last_decision else 0.0,
+            "decision_reason": self._last_decision.reason if self._last_decision else "no_decision",
+            "decision_costs": self._last_decision_context,
+            "policy_state": self.decision_policy.calibration_state(),
             "analytics": self.analytics.snapshot(),
         }
 
@@ -448,6 +499,8 @@ class Bot:
                 if order is not None:
                     self.ms_engine.on_order_submitted()
                     self.exec_quality.on_submitted()
+                    if self._pending_decision_context is not None:
+                        self._order_decisions[order.client_order_id] = dict(self._pending_decision_context)
                     self._log_event(
                         "quote_submitted",
                         {"side": side, "qty": desired_qty, "price": desired_price, "order": asdict(order)},
@@ -476,6 +529,8 @@ class Bot:
             if replaced is not None:
                 self.ms_engine.on_order_submitted()
                 self.exec_quality.on_submitted()
+                if self._pending_decision_context is not None:
+                    self._order_decisions[replaced.client_order_id] = dict(self._pending_decision_context)
             self._log_event(
                 "quote_replaced",
                 {
@@ -521,23 +576,23 @@ class Bot:
                 regime = self.regime_detector.update(quote.mid)
                 self._current_regime = regime.regime if hasattr(regime, "regime") else "unknown"
 
-                if self._self_cal_enabled:
-                    did_cal = self.calibrator.maybe_calibrate(
-                        fill_count=self.state.trade_count,
-                        every_n=self._self_cal_every_n,
-                        analytics=self.analytics.snapshot(),
+                if self._self_cal_enabled and self.state.trade_count > 0 and self.state.trade_count % self._self_cal_every_n == 0:
+                    self.calibrator._run_calibration(
+                        self.analytics.snapshot(),
+                        policy=self.decision_policy,
+                        outcomes=self.analytics.decision_outcomes(),
+                        artifact_dir=self.settings.db_path.parent / "calibration",
                     )
-                    if did_cal:
-                        self.spread_surface.as_gamma = self.calibrator.as_gamma
-                        self.edge_gate = NetEdgeGate(min_net_edge_bps=self.calibrator.min_net_edge_bps)
-                        self._log_event(
-                            "self_calibration_applied",
-                            {
-                                "gamma": self.calibrator.as_gamma,
-                                "ofi_skew_bps": self.calibrator.ofi_skew_bps,
-                                "edge_bps": self.calibrator.min_net_edge_bps,
-                            },
-                        )
+                    self.spread_surface.as_gamma = self.calibrator.as_gamma
+                    self._log_event(
+                        "self_calibration_applied",
+                        {
+                            "gamma": self.calibrator.as_gamma,
+                            "ofi_skew_bps": self.calibrator.ofi_skew_bps,
+                            "edge_bps": self.calibrator.min_net_edge_bps,
+                            "policy": self.decision_policy.calibration_state(),
+                        },
+                    )
                 elif not ms.should_liquidate and self._liquidation_mode:
                     self._liquidation_mode = False
                     self._log_event("liquidation_mode_exited", {"p_toxic": ms.bayes_p_toxic})
@@ -610,7 +665,7 @@ class Bot:
                 if quote.mid > 0:
                     self._apply_funding_if_needed(quote.mid, now)
 
-                for fill in self.bid_orders.reconcile() + self.ask_orders.reconcile():
+                for fill in self.bid_orders.reconcile(current_quote=quote) + self.ask_orders.reconcile(current_quote=quote):
                     self._apply_fill(fill)
 
                 blocked, reason = self.risk.is_blocked(self.state, now, data_age)
@@ -730,6 +785,7 @@ class Bot:
                     if ms is not None and abs(ms.ofi_score) >= self.inventory_accel_ratio
                     else 0.0
                 )
+                self._pending_decision_context = None
                 ofi_score = (ms.ofi_score * self.calibrator.ofi_skew_bps) if ms is not None else 0.0
                 momentum_bps = (
                     ms.momentum.composite_bps * float(os.getenv("AS_MOMENTUM_FACTOR", "0.3"))
@@ -751,31 +807,68 @@ class Bot:
                 if plan is None:
                     dashboard_signal_text = "no_quote"
                 else:
-                    gross_edge_bps = plan.half_spread_bps * max(self.edge_capture_multiplier, 0.1)
+                    expected_capture_bps = plan.half_spread_bps * max(self.edge_capture_multiplier, 0.1)
                     fee_bps = self.edge_fee_bps
                     quote_notional = quote.mid * max(max(plan.bid_qty, plan.ask_qty), 1e-9)
                     modeled_notional = max(quote_notional, self.slippage_notional_floor_usd)
                     slippage_bps = (self.max_avg_slippage_usd / max(modeled_notional, 1e-9)) * 10000.0
                     adverse_penalty_bps = 0.8 if regime.regime in {"trend", "high_vol"} else 0.2
-                    edge_decision = self.edge_gate.evaluate(
-                        expected_edge_bps=gross_edge_bps,
+                    fill_prob = self.decision_policy.estimate_fill_probability(
+                        regime=regime.regime,
+                        queue_position=ms.queue_position if ms is not None else "unknown",
+                        observed_fill_rate=metrics.fill_ratio,
+                    )
+                    uncertainty = min(max(regime.volatility_bps / 10.0 + data_age / max(self.settings.stale_data_seconds, 1.0), 0.0), 1.0)
+                    decision_input = DecisionInput(
+                        expected_capture_bps=expected_capture_bps,
+                        spread_half_bps=plan.half_spread_bps,
+                        ofi_score=ms.ofi_score if ms is not None else 0.0,
+                        momentum_bps=ms.momentum.composite_bps if ms is not None else 0.0,
+                        regime=regime.regime,
+                        queue_position=ms.queue_position if ms is not None else "unknown",
+                        inventory_ratio=plan.inventory_ratio,
+                        estimated_fill_prob=fill_prob,
+                        adverse_selection_bps=adverse_penalty_bps,
                         fee_bps=fee_bps,
                         slippage_bps=slippage_bps,
-                        adverse_selection_bps=adverse_penalty_bps,
+                        uncertainty=uncertainty,
+                        toxicity_prob=ms.bayes_p_toxic if ms is not None else 0.2,
                     )
+                    edge_decision = self.decision_policy.evaluate(decision_input)
+                    self.analytics.record_decision(
+                        regime=regime.regime,
+                        should_trade=edge_decision.should_trade,
+                        expected_net_bps=edge_decision.expected_net_bps,
+                        threshold_bps=edge_decision.threshold_used,
+                        confidence=edge_decision.confidence,
+                        reason=edge_decision.reason,
+                    )
+                    self._last_decision = edge_decision
+                    self._last_decision_context = {
+                        "expected_net_bps": edge_decision.expected_net_bps,
+                        "confidence": edge_decision.confidence,
+                        "threshold_used": edge_decision.threshold_used,
+                        "fee_bps": fee_bps,
+                        "slippage_bps": slippage_bps,
+                        "adverse_selection_bps": adverse_penalty_bps,
+                        "fill_prob": fill_prob,
+                    }
                     if not edge_decision.should_trade:
+                        self._pending_decision_context = None
                         self._cancel_all_pending_orders()
                         self._log_event(
                             "net_edge_block",
                             {
                                 "reason": edge_decision.reason,
-                                "net_edge_bps": edge_decision.net_edge_bps,
-                                "gross_edge_bps": gross_edge_bps,
+                                "expected_net_bps": edge_decision.expected_net_bps,
+                                "expected_capture_bps": expected_capture_bps,
                                 "fee_bps": fee_bps,
                                 "slippage_bps": slippage_bps,
                                 "modeled_notional_usd": modeled_notional,
                                 "adverse_penalty_bps": adverse_penalty_bps,
                                 "regime": regime.regime,
+                                "confidence": edge_decision.confidence,
+                                "threshold_used": edge_decision.threshold_used,
                             },
                         )
                         self._record_loop_latency(loop_start_ns, perf_counter_ns())
@@ -783,6 +876,7 @@ class Bot:
                         continue
 
                     dashboard_signal_text = f"mm:{plan.half_spread_bps:.2f}bps inv:{plan.inventory_ratio:+.2f}"
+                    self._pending_decision_context = dict(self._last_decision_context)
                     self._manage_quote_leg("buy", self.bid_orders, plan.bid_price, plan.bid_qty, now)
                     self._manage_quote_leg("sell", self.ask_orders, plan.ask_price, plan.ask_qty, now)
 
@@ -810,6 +904,13 @@ class Bot:
                         "liquidation_mode": self._liquidation_mode,
                         "calibrator_gamma": self.calibrator.as_gamma,
                         "calibrator_edge_bps": self.calibrator.min_net_edge_bps,
+                        "decision_should_trade": self._last_decision.should_trade if self._last_decision else False,
+                        "decision_expected_net_bps": self._last_decision.expected_net_bps if self._last_decision else 0.0,
+                        "decision_confidence": self._last_decision.confidence if self._last_decision else 0.0,
+                        "decision_threshold_used": self._last_decision.threshold_used if self._last_decision else 0.0,
+                        "decision_reason": self._last_decision.reason if self._last_decision else "no_decision",
+                        "decision_costs": self._last_decision_context,
+                        "policy_state": self.decision_policy.calibration_state(),
                         "analytics": self.analytics.snapshot(),
                     },
                 )

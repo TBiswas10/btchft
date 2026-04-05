@@ -18,7 +18,8 @@ from .microstructure import MicrostructureEngine
 from .models import PositionState, QuoteSnapshot, RuntimeState
 from .order_manager import FillResult, OrderManager
 from .portfolio import apply_fill_to_state, mark_to_market_unrealized_pnl
-from .profit_controls import AdverseSelectionGuard, ExecutionQualityMonitor, NetEdgeGate, RegimeDetector
+from .profit_controls import AdverseSelectionGuard, ExecutionQualityMonitor, RegimeDetector
+from .decision_policy import DecisionInput, ExpectancyDecisionPolicy, TradeDecision
 from .self_calibration import SelfCalibrator
 from .spread_surface import SpreadSurface
 
@@ -57,6 +58,10 @@ class BacktestTrade:
     ofi_score: float
     queue_position: str
     p_toxic: float
+    expected_net_bps: float = 0.0
+    realized_net_bps: float = 0.0
+    confidence: float = 0.0
+    threshold_used: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -168,7 +173,7 @@ class BacktestEngine:
         )
         self.bid_orders = OrderManager(trading=None, dry_run=True)
         self.ask_orders = OrderManager(trading=None, dry_run=True)
-        self.edge_gate = NetEdgeGate(strategy.min_net_edge_bps)
+        self.decision_policy = ExpectancyDecisionPolicy(base_threshold_bps=max(0.05, strategy.min_net_edge_bps))
         self.exec_quality = ExecutionQualityMonitor()
         self.adverse_guard = AdverseSelectionGuard(move_bps_threshold=settings.take_profit_bps, cooldown_seconds=settings.cooldown_seconds)
         self.market_maker = (
@@ -184,6 +189,8 @@ class BacktestEngine:
         self._ofi_future_moves: list[tuple[float, float]] = []
         self._toxicity_events: list[tuple[float, float]] = []
         self._spread_buckets: dict[str, list[float]] = {"low": [], "mid": [], "high": []}
+        self._last_decision: TradeDecision | None = None
+        self._last_costs_bps: dict[str, float] = {}
 
     def _upgrade_market_maker(self):
         surface = SpreadSurface(
@@ -214,6 +221,13 @@ class BacktestEngine:
 
     def _record_trade(self, fill: FillResult, impact, regime: str, ofi_score: float, queue_position: str, p_toxic: float, quote_mid: float) -> None:
         spread_capture = impact.realized_pnl_usd + impact.fee_usd + impact.slippage_usd
+        notional = max(fill.price * fill.qty, 1e-9)
+        fee_bps = (impact.fee_usd / notional) * 10000.0
+        slippage_bps = (impact.slippage_usd / notional) * 10000.0
+        adverse_bps = self._last_costs_bps.get("adverse_selection_bps", 0.0)
+        realized_net_bps = (impact.realized_pnl_usd - impact.fee_usd - impact.slippage_usd) / notional * 10000.0
+        expected_net_bps = self._last_decision.expected_net_bps if self._last_decision else 0.0
+        confidence = self._last_decision.confidence if self._last_decision else 0.0
         self.analytics.record_fill(
             realized_pnl=impact.realized_pnl_usd,
             spread_capture=spread_capture,
@@ -222,6 +236,13 @@ class BacktestEngine:
             vol_bps=0.0,
             queue_position=queue_position,
             side=fill.side,
+            expected_net_bps=expected_net_bps,
+            realized_net_bps=realized_net_bps,
+            confidence=confidence,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            adverse_selection_bps=adverse_bps,
+            expected_fill_prob=self._last_costs_bps.get("fill_prob", 0.0),
         )
         self.exec_quality.on_fill(impact.slippage_usd)
         self._trades.append(
@@ -238,6 +259,10 @@ class BacktestEngine:
                 ofi_score=ofi_score,
                 queue_position=queue_position,
                 p_toxic=p_toxic,
+                expected_net_bps=expected_net_bps,
+                realized_net_bps=realized_net_bps,
+                confidence=confidence,
+                threshold_used=self._last_decision.threshold_used if self._last_decision else 0.0,
             )
         )
         if p_toxic >= self.settings.bayes_toxic_threshold:
@@ -383,36 +408,74 @@ class BacktestEngine:
                     continue
                 spread_bps = plan.half_spread_bps * 2.0
                 self._spread_buckets["low" if ms.vol_bps < 1.5 else "mid" if ms.vol_bps < 4.0 else "high"].append(spread_bps)
-                edge_decision = self.edge_gate.evaluate(
-                    expected_edge_bps=plan.half_spread_bps * 2.0,
-                    fee_bps=self.settings.market_maker_reprice_bps,
-                    slippage_bps=0.5,
-                    adverse_selection_bps=0.2 if regime.regime in {"trend", "high_vol"} else 0.1,
-                )
-                if not edge_decision.should_trade:
-                    self._edge_blocks += 1
-                    self.exec_quality.on_rejected()
-                    self.bid_orders.cancel_pending()
-                    self.ask_orders.cancel_pending()
-                    continue
+                queue_position = ms.queue_position
+                inventory_ratio = plan.inventory_ratio
+                ofi_input = ms.ofi_score
+                momentum_input = ms.momentum.composite_bps
+                tox_prob = ms.bayes_p_toxic
             else:
                 plan = self.market_maker.build_plan(quote, self.state.position)
                 if plan is None:
                     continue
                 spread_bps = plan["half_spread_bps"] * 2.0
                 self._spread_buckets["low" if regime.volatility_bps < 1.5 else "mid" if regime.volatility_bps < 4.0 else "high"].append(spread_bps)
-                edge_decision = self.edge_gate.evaluate(expected_edge_bps=spread_bps, fee_bps=0.0, slippage_bps=0.5, adverse_selection_bps=0.1)
-                if not edge_decision.should_trade:
-                    self._edge_blocks += 1
-                    self.exec_quality.on_rejected()
-                    self.bid_orders.cancel_pending()
-                    self.ask_orders.cancel_pending()
-                    continue
+                queue_position = "unknown"
+                inventory_ratio = plan["inventory_ratio"]
+                ofi_input = 0.0
+                momentum_input = 0.0
+                tox_prob = 0.2
+
+            fill_prob = self.decision_policy.estimate_fill_probability(regime.regime, queue_position, self.analytics.fill_rate)
+            adverse_bps = 0.35 if regime.regime == "high_vol" else 0.22 if regime.regime == "trend" else 0.10
+            slippage_bps = 0.35 if queue_position == "back" else 0.18
+            fee_bps = self.settings.market_maker_reprice_bps if self.strategy.upgraded else 0.0
+            uncertainty = min(max(regime.volatility_bps / 10.0, 0.0), 1.0)
+            decision_input = DecisionInput(
+                expected_capture_bps=spread_bps,
+                spread_half_bps=spread_bps / 2.0,
+                ofi_score=ofi_input,
+                momentum_bps=momentum_input,
+                regime=regime.regime,
+                queue_position=queue_position,
+                inventory_ratio=inventory_ratio,
+                estimated_fill_prob=fill_prob,
+                adverse_selection_bps=adverse_bps,
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                uncertainty=uncertainty,
+                toxicity_prob=tox_prob,
+            )
+            decision = self.decision_policy.evaluate(decision_input)
+            self.analytics.record_decision(
+                regime=regime.regime,
+                should_trade=decision.should_trade,
+                expected_net_bps=decision.expected_net_bps,
+                threshold_bps=decision.threshold_used,
+                confidence=decision.confidence,
+                reason=decision.reason,
+            )
+            self._last_decision = decision
+            self._last_costs_bps = {
+                "fee_bps": fee_bps,
+                "slippage_bps": slippage_bps,
+                "adverse_selection_bps": adverse_bps,
+                "fill_prob": fill_prob,
+            }
+            if not decision.should_trade:
+                self._edge_blocks += 1
+                self.exec_quality.on_rejected()
+                self.bid_orders.cancel_pending()
+                self.ask_orders.cancel_pending()
+                continue
 
             if self.strategy.upgraded:
                 if self.state.trade_count > 0 and self.state.trade_count % self.settings.self_cal_every_n_fills == 0:
-                    self.calibrator.maybe_calibrate(self.state.trade_count, self.settings.self_cal_every_n_fills, self.analytics.snapshot())
-                    self.edge_gate = NetEdgeGate(self.calibrator.min_net_edge_bps)
+                    self.calibrator._run_calibration(
+                        self.analytics.snapshot(),
+                        policy=self.decision_policy,
+                        outcomes=self.analytics.decision_outcomes(),
+                        artifact_dir=Path("runtime/calibration"),
+                    )
 
             if self.strategy.upgraded:
                 bid_price = plan.bid_price

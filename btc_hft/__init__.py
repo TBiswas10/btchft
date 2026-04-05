@@ -8,6 +8,7 @@ __all__ = [
     "latency",
     "microstructure",
     "analytics",
+    "decision_policy",
     "self_calibration",
     "spread_surface",
     "backtest",

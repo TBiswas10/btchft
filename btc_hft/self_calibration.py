@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+from .decision_policy import ExpectancyDecisionPolicy, calibrate_policy_from_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +77,18 @@ class SelfCalibrator:
         self._run_calibration(analytics)
         return True
 
-    def _run_calibration(self, analytics: dict) -> None:
-        current_sharpe = analytics.get("sharpe", 0.0)
-        current_fill_rate = analytics.get("fill_rate", 0.5)
+    def _run_calibration(
+        self,
+        analytics: dict,
+        policy: ExpectancyDecisionPolicy | None = None,
+        outcomes: list | None = None,
+        artifact_dir: Path | None = None,
+    ) -> None:
+        current_sharpe = float(analytics.get("sharpe", 0.0))
+        current_fill_rate = float(analytics.get("fill_rate", 0.5))
+        rolling_expectancy = float(analytics.get("rolling_post_cost_expectancy_bps", 0.0))
+        ci_low = float(analytics.get("expectancy_ci_low_bps", 0.0))
+        regime_expectancy = analytics.get("regime_expectancy_bps", {}) or {}
 
         self._calibration_count += 1
         old_gamma = self.as_gamma
@@ -92,35 +104,41 @@ class SelfCalibrator:
             return
 
         sharpe_improved = current_sharpe > self._prev_sharpe
-        fill_rate_low = current_fill_rate < 0.30
-        fill_rate_high = current_fill_rate > 0.70
+        expectancy_positive = rolling_expectancy > 0 and ci_low > 0
+        fill_rate_low = current_fill_rate < 0.10
+        fill_rate_high = current_fill_rate > 0.80
 
-        if sharpe_improved:
-            if fill_rate_low:
+        high_vol_expectancy = float(regime_expectancy.get("high_vol", 0.0))
+        trend_expectancy = float(regime_expectancy.get("trend", 0.0))
+
+        if expectancy_positive and sharpe_improved:
+            if fill_rate_low and ci_low > 0:
                 self._nudge_gamma(-1)
                 self._nudge_edge(-1)
-                direction_note = "sharpe_up_fill_low_tighten"
+                direction_note = "expectancy_up_fill_low_relax"
             else:
                 self._nudge_gamma(self._last_gamma_direction if self._last_gamma_direction != 0 else -1)
-                direction_note = "sharpe_up_reinforce"
+                direction_note = "expectancy_up_reinforce"
         else:
             reverse = -self._last_gamma_direction if self._last_gamma_direction != 0 else 1
             self._nudge_gamma(reverse)
-            if fill_rate_high:
+            if fill_rate_high or rolling_expectancy < 0:
                 self._nudge_edge(+1)
-                direction_note = "sharpe_down_fill_high_widen"
+                direction_note = "expectancy_down_tighten"
             elif fill_rate_low:
                 self._nudge_edge(-1)
-                direction_note = "sharpe_down_fill_low_loosen"
+                direction_note = "expectancy_down_fill_low_probe"
             else:
-                direction_note = "sharpe_down_reverse_gamma"
+                direction_note = "expectancy_down_reverse_gamma"
 
-        ofi_regime = analytics.get("regime_pnl", {})
-        trending_pnl = ofi_regime.get("trend", {}).get("avg_usd", 0.0)
-        if trending_pnl > 0:
+        if trend_expectancy > 0 and high_vol_expectancy >= 0:
             self.ofi_skew_bps = min(self.max_ofi_skew, self.ofi_skew_bps * (1 + self.step_size))
-        elif trending_pnl < 0:
+        elif trend_expectancy < 0 or high_vol_expectancy < 0:
             self.ofi_skew_bps = max(self.min_ofi_skew, self.ofi_skew_bps * (1 - self.step_size))
+
+        if policy is not None and outcomes:
+            artifact = calibrate_policy_from_outcomes(outcomes, output_dir=artifact_dir)
+            policy.apply_artifact(artifact)
 
         self._prev_sharpe = current_sharpe
         self._prev_fill_rate = current_fill_rate
