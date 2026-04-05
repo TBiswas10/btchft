@@ -31,6 +31,7 @@ class FillRecord:
     slippage_bps: float = 0.0
     adverse_selection_bps: float = 0.0
     expected_fill_prob: float = 0.0
+    quote_notional_usd: float = 0.0
 
 
 class PerformanceAnalytics:
@@ -62,6 +63,7 @@ class PerformanceAnalytics:
         slippage_bps: float = 0.0,
         adverse_selection_bps: float = 0.0,
         expected_fill_prob: float = 0.0,
+        quote_notional_usd: float = 0.0,
     ) -> None:
         self._fills.append(FillRecord(
             realized_pnl=realized_pnl,
@@ -78,6 +80,7 @@ class PerformanceAnalytics:
             slippage_bps=slippage_bps,
             adverse_selection_bps=adverse_selection_bps,
             expected_fill_prob=expected_fill_prob,
+            quote_notional_usd=quote_notional_usd,
         ))
         self._total_fills += 1
 
@@ -203,6 +206,7 @@ class PerformanceAnalytics:
                     fee_bps=fill.fee_bps,
                     slippage_bps=fill.slippage_bps,
                     adverse_selection_bps=fill.adverse_selection_bps,
+                    quote_notional_usd=fill.quote_notional_usd,
                 )
             )
         return outcomes

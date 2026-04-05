@@ -22,7 +22,7 @@ from .models import PositionState, RuntimeState
 from .order_manager import FillResult, OrderManager
 from .portfolio import apply_fill_to_state, apply_funding_to_state, mark_to_market_unrealized_pnl
 from .analytics import PerformanceAnalytics
-from .decision_policy import DecisionInput, ExpectancyDecisionPolicy, TradeDecision
+from .decision_policy import DecisionInput, ExpectancyDecisionPolicy, TradeDecision, load_latest_calibration_artifact
 from .profit_controls import (
     AdverseSelectionGuard,
     ExecutionQualityMonitor,
@@ -94,10 +94,11 @@ class Bot:
         self.calibrator = SelfCalibrator(
             initial_gamma=float(os.getenv("AS_GAMMA", "0.1")),
             initial_ofi_skew_bps=float(os.getenv("OFI_SKEW_BPS", "1.5")),
-            initial_min_edge_bps=float(os.getenv("MIN_NET_EDGE_BPS", "12.0")),
+            initial_min_edge_bps=float(os.getenv("EXPECTANCY_BASE_THRESHOLD_BPS", "1.5")),
             step_size=float(os.getenv("SELF_CAL_STEP_SIZE", "0.05")),
             max_gamma=float(os.getenv("SELF_CAL_MAX_GAMMA", "0.5")),
             min_gamma=float(os.getenv("SELF_CAL_MIN_GAMMA", "0.02")),
+            min_fills_for_policy_update=int(os.getenv("SELF_CAL_MIN_FILLS_FOR_POLICY_UPDATE", "25")),
         )
         self._last_ms: MicrostructureSnapshot | None = None
         self._last_fill_side: str | None = None
@@ -105,12 +106,21 @@ class Bot:
         self._current_regime: str = "unknown"
         self._liquidation_mode: bool = False
         self.regime_detector = RegimeDetector(lookback=int(os.getenv("REGIME_LOOKBACK_TICKS", "40")))
+        calibration_dir = self.settings.db_path.parent / "calibration"
+        legacy_edge = float(os.getenv("MIN_NET_EDGE_BPS", "1.5"))
+        base_threshold = float(os.getenv("EXPECTANCY_BASE_THRESHOLD_BPS", str(min(max(legacy_edge, 1.0), 3.0))))
+        artifact = load_latest_calibration_artifact(calibration_dir)
+        if artifact is not None:
+            base_threshold = min(base_threshold, 1.5)
         self.decision_policy = ExpectancyDecisionPolicy(
-            base_threshold_bps=float(os.getenv("MIN_NET_EDGE_BPS", "0.20")),
+            base_threshold_bps=base_threshold,
             confidence_margin_bps=float(os.getenv("EXPECTANCY_CONF_MARGIN_BPS", "0.15")),
             toxicity_penalty_bps=float(os.getenv("EXPECTANCY_TOXICITY_PENALTY_BPS", "0.30")),
             inventory_penalty_factor=float(os.getenv("EXPECTANCY_INVENTORY_PENALTY", "0.25")),
-            min_confidence=float(os.getenv("EXPECTANCY_MIN_CONFIDENCE", "0.20")),
+            min_confidence=float(os.getenv("EXPECTANCY_MIN_CONFIDENCE", "0.45")),
+            feature_prior_weight=float(os.getenv("EXPECTANCY_FEATURE_PRIOR_WEIGHT", "0.25")),
+            soft_gate_buffer_bps=float(os.getenv("EXPECTANCY_SOFT_GATE_BUFFER_BPS", "0.35")),
+            artifact=artifact,
         )
         self.adverse_guard = AdverseSelectionGuard(
             move_bps_threshold=float(os.getenv("ADVERSE_MOVE_BPS", "4.0")),
@@ -137,6 +147,7 @@ class Bot:
                 channel=os.getenv("ALERT_CHANNEL", "disabled"),
                 webhook_url=os.getenv("ALERT_WEBHOOK_URL", ""),
                 telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+                    calibration_dir = self.settings.db_path.parent / "calibration"
                 telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
                 smtp_host=os.getenv("ALERT_SMTP_HOST", ""),
                 smtp_port=int(os.getenv("ALERT_SMTP_PORT", "587")),
@@ -209,7 +220,6 @@ class Bot:
             est_slippage_usd=impact.slippage_usd,
             funding_pnl_usd=impact.funding_pnl_usd,
         )
-
         logger.info(
             "Fill applied",
             extra={
@@ -301,6 +311,7 @@ class Bot:
             slippage_bps=slippage_bps,
             adverse_selection_bps=adverse_bps,
             expected_fill_prob=expected_fill_prob,
+            quote_notional_usd=notional,
         )
         self._last_fill_side = fill.side
         self._last_fill_price = fill.price
@@ -665,7 +676,17 @@ class Bot:
                 if quote.mid > 0:
                     self._apply_funding_if_needed(quote.mid, now)
 
-                for fill in self.bid_orders.reconcile(current_quote=quote) + self.ask_orders.reconcile(current_quote=quote):
+                bid_prob = 0.0
+                ask_prob = 0.0
+                if self.bid_orders.pending is not None:
+                    bid_ctx = self._order_decisions.get(self.bid_orders.pending.client_order_id, self._last_decision_context)
+                    if isinstance(bid_ctx, dict):
+                        bid_prob = float(bid_ctx.get("fill_prob", 0.0))
+                if self.ask_orders.pending is not None:
+                    ask_ctx = self._order_decisions.get(self.ask_orders.pending.client_order_id, self._last_decision_context)
+                    if isinstance(ask_ctx, dict):
+                        ask_prob = float(ask_ctx.get("fill_prob", 0.0))
+                for fill in self.bid_orders.reconcile(current_quote=quote, expected_fill_prob=bid_prob) + self.ask_orders.reconcile(current_quote=quote, expected_fill_prob=ask_prob):
                     self._apply_fill(fill)
 
                 blocked, reason = self.risk.is_blocked(self.state, now, data_age)
@@ -792,6 +813,9 @@ class Bot:
                     if ms is not None
                     else 0.0
                 )
+                if ms is not None and abs(ofi_score) < 1e-9 and abs(momentum_bps) < 1e-9 and regime.regime in {"normal", "trend", "high_vol"}:
+                    ofi_score = float(os.getenv("FEATURE_PRIOR_OFI_BPS", "0.12"))
+                    momentum_bps = float(os.getenv("FEATURE_PRIOR_MOMENTUM_BPS", "0.60"))
                 plan = self.market_maker.build_plan(
                     quote,
                     self.state.position,
@@ -818,7 +842,16 @@ class Bot:
                         queue_position=ms.queue_position if ms is not None else "unknown",
                         observed_fill_rate=metrics.fill_ratio,
                     )
-                    uncertainty = min(max(regime.volatility_bps / 10.0 + data_age / max(self.settings.stale_data_seconds, 1.0), 0.0), 1.0)
+                    uncertainty = min(
+                        max(
+                            regime.uncertainty,
+                            regime.volatility_bps / 10.0 + data_age / max(self.settings.stale_data_seconds, 1.0),
+                        ),
+                        1.0,
+                    )
+                    if uncertainty >= float(os.getenv("REGIME_UNCERTAINTY_CONSERVATIVE_THRESHOLD", "0.75")):
+                        spread_multiplier = max(spread_multiplier, 1.25)
+                        size_multiplier = min(size_multiplier, 0.65)
                     decision_input = DecisionInput(
                         expected_capture_bps=expected_capture_bps,
                         spread_half_bps=plan.half_spread_bps,
@@ -833,6 +866,7 @@ class Bot:
                         slippage_bps=slippage_bps,
                         uncertainty=uncertainty,
                         toxicity_prob=ms.bayes_p_toxic if ms is not None else 0.2,
+                        quote_notional_usd=modeled_notional,
                     )
                     edge_decision = self.decision_policy.evaluate(decision_input)
                     self.analytics.record_decision(
@@ -848,34 +882,67 @@ class Bot:
                         "expected_net_bps": edge_decision.expected_net_bps,
                         "confidence": edge_decision.confidence,
                         "threshold_used": edge_decision.threshold_used,
+                        "size_multiplier": edge_decision.size_multiplier,
+                        "spread_multiplier": edge_decision.spread_multiplier,
                         "fee_bps": fee_bps,
                         "slippage_bps": slippage_bps,
                         "adverse_selection_bps": adverse_penalty_bps,
                         "fill_prob": fill_prob,
+                        "quote_notional_usd": modeled_notional,
                     }
                     if not edge_decision.should_trade:
-                        self._pending_decision_context = None
-                        self._cancel_all_pending_orders()
+                        if edge_decision.size_multiplier <= 0.0:
+                            self._pending_decision_context = None
+                            self._cancel_all_pending_orders()
+                            self._log_event(
+                                "net_edge_block",
+                                {
+                                    "reason": edge_decision.reason,
+                                    "expected_net_bps": edge_decision.expected_net_bps,
+                                    "expected_capture_bps": expected_capture_bps,
+                                    "fee_bps": fee_bps,
+                                    "slippage_bps": slippage_bps,
+                                    "modeled_notional_usd": modeled_notional,
+                                    "adverse_penalty_bps": adverse_penalty_bps,
+                                    "regime": regime.regime,
+                                    "confidence": edge_decision.confidence,
+                                    "threshold_used": edge_decision.threshold_used,
+                                },
+                            )
+                            self._record_loop_latency(loop_start_ns, perf_counter_ns())
+                            time.sleep(self.runtime_loop_interval_seconds)
+                            continue
+                        soft_spread = spread_multiplier * edge_decision.spread_multiplier
+                        soft_size = size_multiplier * edge_decision.size_multiplier
+                        plan = self.market_maker.build_plan(
+                            quote,
+                            self.state.position,
+                            volatility_bps=regime.volatility_bps,
+                            regime=regime.regime,
+                            spread_multiplier=soft_spread,
+                            size_multiplier=soft_size,
+                            extra_inventory_skew_bps=extra_inventory_skew,
+                            ofi_score=ofi_score,
+                            momentum_bps=momentum_bps,
+                            queue_position=ms.queue_position if ms is not None else "unknown",
+                        )
+                        if plan is None:
+                            self._record_loop_latency(loop_start_ns, perf_counter_ns())
+                            time.sleep(self.runtime_loop_interval_seconds)
+                            continue
                         self._log_event(
-                            "net_edge_block",
+                            "net_edge_soft_gate",
                             {
                                 "reason": edge_decision.reason,
                                 "expected_net_bps": edge_decision.expected_net_bps,
-                                "expected_capture_bps": expected_capture_bps,
-                                "fee_bps": fee_bps,
-                                "slippage_bps": slippage_bps,
-                                "modeled_notional_usd": modeled_notional,
-                                "adverse_penalty_bps": adverse_penalty_bps,
-                                "regime": regime.regime,
-                                "confidence": edge_decision.confidence,
                                 "threshold_used": edge_decision.threshold_used,
+                                "soft_size_multiplier": edge_decision.size_multiplier,
+                                "soft_spread_multiplier": edge_decision.spread_multiplier,
+                                "regime": regime.regime,
                             },
                         )
-                        self._record_loop_latency(loop_start_ns, perf_counter_ns())
-                        time.sleep(self.runtime_loop_interval_seconds)
-                        continue
 
-                    dashboard_signal_text = f"mm:{plan.half_spread_bps:.2f}bps inv:{plan.inventory_ratio:+.2f}"
+                    dashboard_signal_text = f"mm:{plan.half_spread_bps:.2f}bps inv:{plan.inventory_ratio:+.2f} conf:{edge_decision.confidence:.2f}"
                     self._pending_decision_context = dict(self._last_decision_context)
                     self._manage_quote_leg("buy", self.bid_orders, plan.bid_price, plan.bid_qty, now)
                     self._manage_quote_leg("sell", self.ask_orders, plan.ask_price, plan.ask_qty, now)

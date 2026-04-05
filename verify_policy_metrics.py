@@ -120,6 +120,7 @@ def run(args: argparse.Namespace) -> int:
                 "confidence": float(d.get("confidence", 0.0)),
                 "should_trade": bool(d.get("should_trade", False)),
                 "threshold_used": float(d.get("threshold_bps", 0.0)),
+                "reason": str(d.get("reason", "unknown")),
                 "realized_pnl_usd": trade_realized_by_ts.get(ts),
             }
         )
@@ -210,6 +211,7 @@ def run(args: argparse.Namespace) -> int:
                 f"{r['confidence']:.6f}",
                 str(r["should_trade"]),
                 f"{r['threshold_used']:.6f}",
+                r["reason"],
                 "n/a" if r["realized_pnl_usd"] is None else f"{float(r['realized_pnl_usd']):.6f}",
             ]
         )
@@ -223,6 +225,7 @@ def run(args: argparse.Namespace) -> int:
             "confidence",
             "should_trade",
             "threshold_used",
+            "reason",
             "realized_pnl_usd",
         ],
         preview_rows,
@@ -232,7 +235,7 @@ def run(args: argparse.Namespace) -> int:
         out = Path(args.events_out)
         out.parent.mkdir(parents=True, exist_ok=True)
         lines = [
-            "ts\tregime\tpredicted_edge_bps\tconfidence\tshould_trade\tthreshold_used\trealized_pnl_usd"
+            "ts\tregime\tpredicted_edge_bps\tconfidence\tshould_trade\tthreshold_used\treason\trealized_pnl_usd"
         ]
         for r in per_timestamp_rows:
             lines.append(
@@ -244,6 +247,7 @@ def run(args: argparse.Namespace) -> int:
                         f"{r['confidence']:.6f}",
                         str(r["should_trade"]),
                         f"{r['threshold_used']:.6f}",
+                        r["reason"],
                         "" if r["realized_pnl_usd"] is None else f"{float(r['realized_pnl_usd']):.6f}",
                     ]
                 )

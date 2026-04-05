@@ -36,6 +36,7 @@ class RegimeSnapshot:
     regime: str
     volatility_bps: float
     trend_bps: float
+    uncertainty: float
 
 
 class RegimeDetector:
@@ -47,11 +48,11 @@ class RegimeDetector:
 
     def update(self, mid: float) -> RegimeSnapshot:
         if mid <= 0:
-            return RegimeSnapshot("unknown", 0.0, 0.0)
+            return RegimeSnapshot("unknown", 0.0, 0.0, 1.0)
 
         self.mids.append(mid)
         if len(self.mids) < 5:
-            return RegimeSnapshot("warmup", 0.0, 0.0)
+            return RegimeSnapshot("warmup", 0.0, 0.0, 1.0)
 
         series = list(self.mids)
         returns = []
@@ -62,7 +63,7 @@ class RegimeDetector:
                 returns.append(((curr - prev) / prev) * 10000.0)
 
         if not returns:
-            return RegimeSnapshot("warmup", 0.0, 0.0)
+            return RegimeSnapshot("warmup", 0.0, 0.0, 1.0)
 
         mean_abs = sum(abs(x) for x in returns) / len(returns)
         trend = ((series[-1] - series[0]) / max(series[0], 1e-9)) * 10000.0
@@ -76,7 +77,16 @@ class RegimeDetector:
         else:
             regime = "normal"
 
-        return RegimeSnapshot(regime, mean_abs, trend)
+        # Sanity guard: if directional drift is material, avoid misclassifying as quiet.
+        if regime == "quiet" and abs(trend) >= 4.0:
+            regime = "normal"
+
+        vol_distance = min(abs(mean_abs - 1.0), abs(mean_abs - 3.0))
+        trend_distance = abs(abs(trend) - 8.0)
+        edge_distance = min(vol_distance / 2.0, trend_distance / 8.0)
+        uncertainty = max(0.0, min(1.0, 1.0 - edge_distance))
+
+        return RegimeSnapshot(regime, mean_abs, trend, uncertainty)
 
 
 class AdverseSelectionGuard:

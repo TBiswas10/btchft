@@ -1,0 +1,29 @@
+{
+  "version": "expectancy_20260405_082500",
+  "created_at": "2026-04-05T08:25:00.837378+00:00",
+  "regime_params": {
+    "quiet": {
+      "threshold_bps": 4.126938,
+      "fill_prob": 0.778947,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.545525,
+      "sample_count": 39
+    }
+  },
+  "regime_bucket_params": {
+    "quiet|micro": {
+      "threshold_bps": 6.803539,
+      "fill_prob": 0.793182,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.545509,
+      "sample_count": 22
+    },
+    "quiet|small": {
+      "threshold_bps": 3.021644,
+      "fill_prob": 0.814706,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.657316,
+      "sample_count": 17
+    }
+  }
+}

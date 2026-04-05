@@ -1,0 +1,41 @@
+VERIFY_POLICY_METRICS
+source	runtime\backtests\mixed_regime\window_003.log
+ticks_loaded	3988
+decisions_recorded	417
+trades_executed	6
+total_pnl_usd	-156.885027
+overall_predicted_edge_vs_realized_pnl_corr	-0.020663
+
+PER_REGIME_SUMMARY
+regime	decision_count	avg_predicted_edge_bps	std_predicted_edge_bps	avg_realized_pnl_usd	std_realized_pnl_usd	total_trades_executed
+quiet	413	0.089570	0.816436	-39.221257	78.269604	6
+normal	0	0.000000	0.000000	n/a	n/a	0
+trend	0	0.000000	0.000000	n/a	n/a	0
+high_vol	0	0.000000	0.000000	n/a	n/a	0
+warmup	4	-0.000000	0.000000	n/a	n/a	0
+unknown	0	0.000000	0.000000	n/a	n/a	0
+
+REGIME_BEHAVIOR_CHECKS
+regime	trades_executed	decision_count	check
+quiet	6	413	PASS suppressed
+normal	0	0	PASS low_edge_suppressed
+trend	0	0	PASS low_edge_suppressed
+high_vol	0	0	PASS suppressed
+warmup	0	4	PASS low_edge_suppressed
+unknown	0	0	PASS low_edge_suppressed
+
+PER_TIMESTAMP_PREVIEW
+ts	regime	predicted_edge_bps	confidence	should_trade	threshold_used	reason	realized_pnl_usd
+2026-04-05T06:38:02.585986+00:00	warmup	-0.000000	0.061875	False	2.045887	low_signal_confidence	n/a
+2026-04-05T06:38:02.616679+00:00	warmup	-0.000000	0.061875	False	2.045887	low_signal_confidence	n/a
+2026-04-05T06:38:02.645728+00:00	warmup	-0.000000	0.061875	False	2.045887	low_signal_confidence	n/a
+2026-04-05T06:38:02.674201+00:00	warmup	-0.000000	0.061875	False	2.045887	low_signal_confidence	n/a
+2026-04-05T06:38:02.702140+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
+2026-04-05T06:38:02.809516+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
+2026-04-05T06:38:02.838892+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
+2026-04-05T06:38:02.867089+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
+2026-04-05T06:38:02.894476+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
+2026-04-05T06:38:02.922780+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
+
+events_tsv_written	runtime\backtests\mixed_regime\window_003.events.tsv
+

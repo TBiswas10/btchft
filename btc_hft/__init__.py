@@ -9,6 +9,7 @@ __all__ = [
     "microstructure",
     "analytics",
     "decision_policy",
+    "expectancy_policy",
     "self_calibration",
     "spread_surface",
     "backtest",

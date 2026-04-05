@@ -26,6 +26,7 @@ def _sample_input(**overrides) -> DecisionInput:
         slippage_bps=0.06,
         uncertainty=0.2,
         toxicity_prob=0.15,
+        quote_notional_usd=800.0,
     )
     return DecisionInput(**{**base.__dict__, **overrides})
 
@@ -53,6 +54,14 @@ def test_trade_only_when_post_cost_expectancy_positive() -> None:
     assert decision.expected_net_bps > decision.threshold_used
 
 
+def test_soft_gate_reduces_size_in_near_threshold_case() -> None:
+    policy = ExpectancyDecisionPolicy(base_threshold_bps=1.2, min_confidence=0.4, soft_gate_buffer_bps=0.6)
+    decision = policy.evaluate(_sample_input(expected_capture_bps=1.4, estimated_fill_prob=0.7, uncertainty=0.25))
+    assert not decision.should_trade
+    assert decision.size_multiplier >= 0.0
+    assert decision.spread_multiplier >= 1.0
+
+
 def test_reduced_activity_in_toxic_high_vol_regime() -> None:
     policy = ExpectancyDecisionPolicy(base_threshold_bps=0.1, min_confidence=0.1)
     quiet = policy.evaluate(_sample_input(regime="quiet", toxicity_prob=0.1, uncertainty=0.1, expected_capture_bps=1.6))
@@ -76,6 +85,7 @@ def test_calibration_artifact_walk_forward_and_consistent_decisions(tmp_path: Pa
                 fee_bps=0.08,
                 slippage_bps=0.10,
                 adverse_selection_bps=0.12,
+                quote_notional_usd=600.0 if i % 3 else 1800.0,
             )
         )
 

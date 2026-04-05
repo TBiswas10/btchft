@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
+from dataclasses import replace
 
-from btc_hft.backtest import compare_strategies, load_replay_ticks
+from btc_hft.backtest import BacktestEngine, StrategyParams, compare_strategies, load_replay_ticks
 from btc_hft.models import QuoteSnapshot
 
 
@@ -55,3 +57,31 @@ def test_compare_strategies_produces_metrics(settings) -> None:
     assert reports["baseline"].metrics.total_trades >= 0
     assert reports["upgraded"].metrics.total_trades >= 0
     assert reports["upgraded"].metrics.ofi_validation["positive_sample_count"] >= 0.0
+
+
+def test_positive_edge_slice_can_produce_trades(settings) -> None:
+    random.seed(7)
+    ticks = _make_ticks() * 2
+    tuned = replace(
+        settings,
+        market_maker_target_spread_bps=8.0,
+        spread_min_bps=6.0,
+        market_maker_reprice_bps=0.1,
+        min_net_edge_bps=1.2,
+        order_reprice_seconds=60.0,
+    )
+    engine = BacktestEngine(
+        tuned,
+        StrategyParams(
+            name="tradeable",
+            upgraded=True,
+            as_gamma=tuned.as_gamma,
+            spread_vol_factor=tuned.spread_vol_factor,
+            spread_inventory_factor=tuned.spread_inventory_factor,
+            ofi_skew_bps=tuned.ofi_skew_bps,
+            min_net_edge_bps=1.2,
+        ),
+        seed=7,
+    )
+    report = engine.run(ticks)
+    assert report.metrics.total_trades >= 1

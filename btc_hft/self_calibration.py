@@ -42,14 +42,15 @@ class SelfCalibrator:
         self,
         initial_gamma: float = 0.1,
         initial_ofi_skew_bps: float = 1.5,
-        initial_min_edge_bps: float = 12.0,
+        initial_min_edge_bps: float = 1.5,
         step_size: float = 0.05,
         max_gamma: float = 0.5,
         min_gamma: float = 0.02,
         max_ofi_skew: float = 5.0,
         min_ofi_skew: float = 0.3,
         max_edge_bps: float = 25.0,
-        min_edge_bps: float = 5.0,
+        min_edge_bps: float = 0.5,
+        min_fills_for_policy_update: int = 25,
     ) -> None:
         self.as_gamma = initial_gamma
         self.ofi_skew_bps = initial_ofi_skew_bps
@@ -61,6 +62,7 @@ class SelfCalibrator:
         self.min_ofi_skew = min_ofi_skew
         self.max_edge_bps = max_edge_bps
         self.min_edge_bps = min_edge_bps
+        self.min_fills_for_policy_update = max(5, min_fills_for_policy_update)
 
         self._calibration_count = 0
         self._prev_sharpe: Optional[float] = None
@@ -136,9 +138,18 @@ class SelfCalibrator:
         elif trend_expectancy < 0 or high_vol_expectancy < 0:
             self.ofi_skew_bps = max(self.min_ofi_skew, self.ofi_skew_bps * (1 - self.step_size))
 
-        if policy is not None and outcomes:
+        if policy is not None and outcomes and len(outcomes) >= self.min_fills_for_policy_update:
             artifact = calibrate_policy_from_outcomes(outcomes, output_dir=artifact_dir)
             policy.apply_artifact(artifact)
+        elif policy is not None and outcomes is not None and len(outcomes) < self.min_fills_for_policy_update:
+            logger.info(
+                "Policy calibration skipped due to sparse outcomes",
+                extra={
+                    "event": "policy_calibration_skipped",
+                    "outcome_count": len(outcomes),
+                    "required_count": self.min_fills_for_policy_update,
+                },
+            )
 
         self._prev_sharpe = current_sharpe
         self._prev_fill_rate = current_fill_rate

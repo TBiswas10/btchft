@@ -64,7 +64,7 @@ class OrderManager:
         self.pending = managed
         return managed
 
-    def reconcile(self, current_quote: QuoteSnapshot | None = None) -> list[FillResult]:
+    def reconcile(self, current_quote: QuoteSnapshot | None = None, expected_fill_prob: float | None = None) -> list[FillResult]:
         if not self.pending:
             return []
 
@@ -78,11 +78,16 @@ class OrderManager:
                     side == "sell" and current_quote.bid >= limit_price
                 )
                 if not marketable:
-                    return []
-                if side == "buy":
-                    base_fill_price = min(limit_price, current_quote.ask)
+                    # Passive fill model: allow occasional maker fills without explicit cross in dry-run/replay.
+                    prob = max(0.0, min(float(expected_fill_prob or 0.0), 1.0))
+                    if prob <= 0.0 or random.random() > prob * 0.08:
+                        return []
+                    base_fill_price = limit_price
                 else:
-                    base_fill_price = max(limit_price, current_quote.bid)
+                    if side == "buy":
+                        base_fill_price = min(limit_price, current_quote.ask)
+                    else:
+                        base_fill_price = max(limit_price, current_quote.bid)
             else:
                 base_fill_price = limit_price
 

@@ -19,7 +19,7 @@ from .models import PositionState, QuoteSnapshot, RuntimeState
 from .order_manager import FillResult, OrderManager
 from .portfolio import apply_fill_to_state, mark_to_market_unrealized_pnl
 from .profit_controls import AdverseSelectionGuard, ExecutionQualityMonitor, RegimeDetector
-from .decision_policy import DecisionInput, ExpectancyDecisionPolicy, TradeDecision
+from .decision_policy import DecisionInput, ExpectancyDecisionPolicy, TradeDecision, load_latest_calibration_artifact
 from .self_calibration import SelfCalibrator
 from .spread_surface import SpreadSurface
 
@@ -170,10 +170,18 @@ class BacktestEngine:
             step_size=settings.self_cal_step_size,
             max_gamma=settings.self_cal_max_gamma,
             min_gamma=settings.self_cal_min_gamma,
+            min_fills_for_policy_update=20,
         )
         self.bid_orders = OrderManager(trading=None, dry_run=True)
         self.ask_orders = OrderManager(trading=None, dry_run=True)
-        self.decision_policy = ExpectancyDecisionPolicy(base_threshold_bps=max(0.05, strategy.min_net_edge_bps))
+        bounded_edge = min(max(strategy.min_net_edge_bps, 1.0), 3.0)
+        calibration_artifact = load_latest_calibration_artifact(Path("runtime/calibration"))
+        if calibration_artifact is not None:
+            bounded_edge = min(bounded_edge, 1.5)
+        self.decision_policy = ExpectancyDecisionPolicy(
+            base_threshold_bps=bounded_edge,
+            artifact=calibration_artifact,
+        )
         self.exec_quality = ExecutionQualityMonitor()
         self.adverse_guard = AdverseSelectionGuard(move_bps_threshold=settings.take_profit_bps, cooldown_seconds=settings.cooldown_seconds)
         self.market_maker = (
@@ -243,6 +251,7 @@ class BacktestEngine:
             slippage_bps=slippage_bps,
             adverse_selection_bps=adverse_bps,
             expected_fill_prob=self._last_costs_bps.get("fill_prob", 0.0),
+            quote_notional_usd=notional,
         )
         self.exec_quality.on_fill(impact.slippage_usd)
         self._trades.append(
@@ -341,7 +350,8 @@ class BacktestEngine:
                 self._ofi_future_moves.append((tick.ofi_score, move))
             previous_mid = quote.mid
 
-            fills = self.bid_orders.reconcile(current_quote=quote) + self.ask_orders.reconcile(current_quote=quote)
+            fill_prob = float(self._last_costs_bps.get("fill_prob", 0.0))
+            fills = self.bid_orders.reconcile(current_quote=quote, expected_fill_prob=fill_prob) + self.ask_orders.reconcile(current_quote=quote, expected_fill_prob=fill_prob)
             if fills:
                 self._apply_fills(fills, tick)
 
@@ -429,7 +439,7 @@ class BacktestEngine:
             adverse_bps = 0.35 if regime.regime == "high_vol" else 0.22 if regime.regime == "trend" else 0.10
             slippage_bps = 0.35 if queue_position == "back" else 0.18
             fee_bps = self.settings.market_maker_reprice_bps if self.strategy.upgraded else 0.0
-            uncertainty = min(max(regime.volatility_bps / 10.0, 0.0), 1.0)
+            uncertainty = min(max(regime.uncertainty, regime.volatility_bps / 10.0), 1.0)
             decision_input = DecisionInput(
                 expected_capture_bps=spread_bps,
                 spread_half_bps=spread_bps / 2.0,
@@ -444,6 +454,11 @@ class BacktestEngine:
                 slippage_bps=slippage_bps,
                 uncertainty=uncertainty,
                 toxicity_prob=tox_prob,
+                quote_notional_usd=max(quote.mid * max(
+                    (plan.bid_qty if self.strategy.upgraded else plan["bid_qty"]),
+                    (plan.ask_qty if self.strategy.upgraded else plan["ask_qty"]),
+                    1e-9,
+                ), 0.0),
             )
             decision = self.decision_policy.evaluate(decision_input)
             self.analytics.record_decision(
@@ -462,11 +477,30 @@ class BacktestEngine:
                 "fill_prob": fill_prob,
             }
             if not decision.should_trade:
-                self._edge_blocks += 1
-                self.exec_quality.on_rejected()
-                self.bid_orders.cancel_pending()
-                self.ask_orders.cancel_pending()
-                continue
+                if decision.size_multiplier <= 0.0:
+                    self._edge_blocks += 1
+                    self.exec_quality.on_rejected()
+                    self.bid_orders.cancel_pending()
+                    self.ask_orders.cancel_pending()
+                    continue
+                if self.strategy.upgraded:
+                    plan = self.market_maker.build_plan(
+                        quote,
+                        self.state.position,
+                        volatility_bps=ms.vol_bps,
+                        regime=regime.regime,
+                        spread_multiplier=decision.spread_multiplier,
+                        size_multiplier=decision.size_multiplier,
+                        extra_inventory_skew_bps=extra_inventory if self.strategy.upgraded else 0.0,
+                        ofi_score=ofi_score if self.strategy.upgraded else 0.0,
+                        momentum_bps=momentum_bps if self.strategy.upgraded else 0.0,
+                        queue_position=queue_position,
+                    )
+                    if plan is None:
+                        continue
+                else:
+                    plan["bid_qty"] = plan["bid_qty"] * decision.size_multiplier
+                    plan["ask_qty"] = plan["ask_qty"] * decision.size_multiplier
 
             if self.strategy.upgraded:
                 if self.state.trade_count > 0 and self.state.trade_count % self.settings.self_cal_every_n_fills == 0:
@@ -492,11 +526,11 @@ class BacktestEngine:
             self._manage_leg("sell", self.ask_orders, ask_price, ask_qty, tick.ts, quote)
 
             if self.bid_orders.has_pending():
-                fills = self.bid_orders.reconcile(current_quote=quote)
+                fills = self.bid_orders.reconcile(current_quote=quote, expected_fill_prob=float(self._last_costs_bps.get("fill_prob", 0.0)))
                 if fills:
                     self._apply_fills(fills, tick)
             if self.ask_orders.has_pending():
-                fills = self.ask_orders.reconcile(current_quote=quote)
+                fills = self.ask_orders.reconcile(current_quote=quote, expected_fill_prob=float(self._last_costs_bps.get("fill_prob", 0.0)))
                 if fills:
                     self._apply_fills(fills, tick)
 
