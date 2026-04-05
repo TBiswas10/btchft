@@ -13,6 +13,8 @@ class AutoOpsDecision:
 class AutoOpsGuard:
     """Solo-operator auto-ops checks: stale feeds and abnormal slippage."""
 
+    RECOVERABLE_STREAM_ISSUES = {"auto_stop_stale_feed", "auto_stop_stream_disconnected"}
+
     def __init__(self, stale_data_seconds: int, max_fill_slippage_usd: float) -> None:
         self.stale_data_seconds = max(1, stale_data_seconds)
         self.max_fill_slippage_usd = max(0.0, max_fill_slippage_usd)
@@ -41,6 +43,10 @@ class AutoOpsGuard:
         if slippage_usd > self.max_fill_slippage_usd:
             return AutoOpsDecision(True, "auto_stop_abnormal_slippage")
         return AutoOpsDecision(False)
+
+    @classmethod
+    def is_recoverable_stream_issue(cls, reason: str | None) -> bool:
+        return reason in cls.RECOVERABLE_STREAM_ISSUES
 
     def should_emit_daily_report(self, now: datetime | None = None) -> bool:
         current = (now or datetime.now(timezone.utc)).date().isoformat()

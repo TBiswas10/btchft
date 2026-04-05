@@ -66,7 +66,7 @@ def test_reduced_activity_in_toxic_high_vol_regime() -> None:
     policy = ExpectancyDecisionPolicy(base_threshold_bps=0.1, min_confidence=0.1)
     quiet = policy.evaluate(_sample_input(regime="quiet", toxicity_prob=0.1, uncertainty=0.1, expected_capture_bps=1.6))
     toxic = policy.evaluate(_sample_input(regime="high_vol", toxicity_prob=0.9, uncertainty=0.9, expected_capture_bps=1.6))
-    assert quiet.should_trade or quiet.reason == "post_cost_expectancy_below_threshold"
+    assert quiet.should_trade or quiet.reason in {"post_cost_expectancy_below_threshold", "quiet_regime_hold_for_stronger_edge"}
     assert not toxic.should_trade
 
 

@@ -1,23 +1,23 @@
 VERIFY_POLICY_METRICS
 source	runtime\backtests\mixed_regime\window_001.log
 ticks_loaded	3966
-decisions_recorded	1098
-trades_executed	5
-total_pnl_usd	-666.914987
-overall_predicted_edge_vs_realized_pnl_corr	0.999630
+decisions_recorded	1092
+trades_executed	11
+total_pnl_usd	-117.258546
+overall_predicted_edge_vs_realized_pnl_corr	-0.650813
 
 PER_REGIME_SUMMARY
-regime	decision_count	avg_predicted_edge_bps	std_predicted_edge_bps	avg_realized_pnl_usd	std_realized_pnl_usd	total_trades_executed
-quiet	1094	0.183720	1.441263	-166.728747	333.638894	5
-normal	0	0.000000	0.000000	n/a	n/a	0
-trend	0	0.000000	0.000000	n/a	n/a	0
-high_vol	0	0.000000	0.000000	n/a	n/a	0
-warmup	4	-0.000000	0.000000	n/a	n/a	0
-unknown	0	0.000000	0.000000	n/a	n/a	0
+regime	decision_count	avg_predicted_edge_bps	std_predicted_edge_bps	avg_realized_pnl_usd	std_realized_pnl_usd	corr_pred_edge_vs_realized_pnl	signals_should_trade	total_trades_executed
+quiet	1088	0.013579	0.584859	-10.659868	24.916306	-0.650813	0	11
+normal	0	0.000000	0.000000	n/a	n/a	0.000000	0	0
+trend	0	0.000000	0.000000	n/a	n/a	0.000000	0	0
+high_vol	0	0.000000	0.000000	n/a	n/a	0.000000	0	0
+warmup	4	-0.000000	0.000000	n/a	n/a	0.000000	0	0
+unknown	0	0.000000	0.000000	n/a	n/a	0.000000	0	0
 
 REGIME_BEHAVIOR_CHECKS
 regime	trades_executed	decision_count	check
-quiet	5	1094	PASS suppressed
+quiet	11	1088	PASS suppressed
 normal	0	0	PASS low_edge_suppressed
 trend	0	0	PASS low_edge_suppressed
 high_vol	0	0	PASS suppressed
@@ -26,16 +26,6 @@ unknown	0	0	PASS low_edge_suppressed
 
 PER_TIMESTAMP_PREVIEW
 ts	regime	predicted_edge_bps	confidence	should_trade	threshold_used	reason	realized_pnl_usd
-2026-04-05T06:36:04.027446+00:00	warmup	-0.000000	0.061875	False	2.045887	low_signal_confidence	n/a
-2026-04-05T06:36:04.054974+00:00	warmup	-0.000000	0.061875	False	2.045887	low_signal_confidence	n/a
-2026-04-05T06:36:04.082013+00:00	warmup	-0.000000	0.061875	False	2.045887	low_signal_confidence	n/a
-2026-04-05T06:36:04.110543+00:00	warmup	-0.000000	0.061875	False	2.045887	low_signal_confidence	n/a
-2026-04-05T06:36:04.138577+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
-2026-04-05T06:36:04.167113+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
-2026-04-05T06:36:04.195807+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
-2026-04-05T06:36:04.222982+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
-2026-04-05T06:36:04.251520+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
-2026-04-05T06:36:04.279050+00:00	quiet	-0.000000	0.211875	False	2.118219	low_signal_confidence	n/a
 
 events_tsv_written	runtime\backtests\mixed_regime\window_001.events.tsv
 

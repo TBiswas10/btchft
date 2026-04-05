@@ -48,6 +48,12 @@ def test_auto_ops_stale_feed_and_slippage() -> None:
     assert slippage.reason == "auto_stop_abnormal_slippage"
 
 
+def test_stream_issue_recovery_reason_is_reconnectable() -> None:
+    assert AutoOpsGuard.is_recoverable_stream_issue("auto_stop_stale_feed")
+    assert AutoOpsGuard.is_recoverable_stream_issue("auto_stop_stream_disconnected")
+    assert not AutoOpsGuard.is_recoverable_stream_issue("auto_stop_abnormal_slippage")
+
+
 def test_auto_ops_does_not_stop_before_first_stream_message() -> None:
     guard = AutoOpsGuard(stale_data_seconds=10, max_fill_slippage_usd=1.5)
     decision = guard.check_health(

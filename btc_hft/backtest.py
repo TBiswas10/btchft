@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sqlite3
 from dataclasses import asdict, dataclass, field
@@ -19,7 +20,13 @@ from .models import PositionState, QuoteSnapshot, RuntimeState
 from .order_manager import FillResult, OrderManager
 from .portfolio import apply_fill_to_state, mark_to_market_unrealized_pnl
 from .profit_controls import AdverseSelectionGuard, ExecutionQualityMonitor, RegimeDetector
-from .decision_policy import DecisionInput, ExpectancyDecisionPolicy, TradeDecision, load_latest_calibration_artifact
+from .adaptive_expectancy_policy import (
+    AdaptiveExpectancyPolicy,
+    DecisionInput,
+    DecisionOutcome,
+    TradeDecision,
+    load_latest_calibration_artifact,
+)
 from .self_calibration import SelfCalibrator
 from .spread_surface import SpreadSurface
 
@@ -174,12 +181,21 @@ class BacktestEngine:
         )
         self.bid_orders = OrderManager(trading=None, dry_run=True)
         self.ask_orders = OrderManager(trading=None, dry_run=True)
-        bounded_edge = min(max(strategy.min_net_edge_bps, 1.0), 3.0)
+        bounded_edge = min(max(strategy.min_net_edge_bps, 0.25), 1.25)
         calibration_artifact = load_latest_calibration_artifact(Path("runtime/calibration"))
         if calibration_artifact is not None:
-            bounded_edge = min(bounded_edge, 1.5)
-        self.decision_policy = ExpectancyDecisionPolicy(
+            bounded_edge = min(bounded_edge, 0.35)
+        enforce_artifact_readiness = os.getenv("EXPECTANCY_ENFORCE_ARTIFACT_READINESS_REPLAY", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.decision_policy = AdaptiveExpectancyPolicy(
             base_threshold_bps=bounded_edge,
+            calibration_dir=Path("runtime/calibration"),
+            enforce_artifact_readiness=enforce_artifact_readiness,
+            min_artifacts_per_regime=2,
             artifact=calibration_artifact,
         )
         self.exec_quality = ExecutionQualityMonitor()
@@ -272,6 +288,21 @@ class BacktestEngine:
                 realized_net_bps=realized_net_bps,
                 confidence=confidence,
                 threshold_used=self._last_decision.threshold_used if self._last_decision else 0.0,
+            )
+        )
+        self.decision_policy.observe_outcome(
+            DecisionOutcome(
+                regime=regime,
+                queue_position=queue_position,
+                expected_net_bps=expected_net_bps,
+                realized_net_bps=realized_net_bps,
+                expected_capture_bps=spread_capture,
+                fill_prob=self._last_costs_bps.get("fill_prob", 0.0),
+                confidence=confidence,
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                adverse_selection_bps=adverse_bps,
+                quote_notional_usd=notional,
             )
         )
         if p_toxic >= self.settings.bayes_toxic_threshold:
@@ -435,10 +466,29 @@ class BacktestEngine:
                 momentum_input = 0.0
                 tox_prob = 0.2
 
-            fill_prob = self.decision_policy.estimate_fill_probability(regime.regime, queue_position, self.analytics.fill_rate)
-            adverse_bps = 0.35 if regime.regime == "high_vol" else 0.22 if regime.regime == "trend" else 0.10
-            slippage_bps = 0.35 if queue_position == "back" else 0.18
-            fee_bps = self.settings.market_maker_reprice_bps if self.strategy.upgraded else 0.0
+            quote_notional_for_cost = max(
+                quote.mid * max(
+                    (plan.bid_qty if self.strategy.upgraded else plan["bid_qty"]),
+                    (plan.ask_qty if self.strategy.upgraded else plan["ask_qty"]),
+                    1e-9,
+                ),
+                1e-9,
+            )
+            fallback_adverse = 0.35 if regime.regime == "high_vol" else 0.22 if regime.regime == "trend" else 0.10
+            fallback_slippage = 0.35 if queue_position == "back" else 0.18
+            empirical_cost = self.decision_policy.estimate_empirical_costs(
+                regime=regime.regime,
+                quote_notional_usd=quote_notional_for_cost,
+                queue_position=queue_position,
+                maker_fee_bps=self.settings.market_maker_reprice_bps if self.strategy.upgraded else 0.0,
+                fallback_slippage_bps=fallback_slippage,
+                fallback_adverse_bps=fallback_adverse,
+                observed_fill_rate=self.analytics.fill_rate,
+            )
+            fill_prob = empirical_cost.fill_prob
+            adverse_bps = empirical_cost.adverse_selection_bps
+            slippage_bps = empirical_cost.slippage_bps
+            fee_bps = empirical_cost.fee_bps
             uncertainty = min(max(regime.uncertainty, regime.volatility_bps / 10.0), 1.0)
             decision_input = DecisionInput(
                 expected_capture_bps=spread_bps,
@@ -454,11 +504,7 @@ class BacktestEngine:
                 slippage_bps=slippage_bps,
                 uncertainty=uncertainty,
                 toxicity_prob=tox_prob,
-                quote_notional_usd=max(quote.mid * max(
-                    (plan.bid_qty if self.strategy.upgraded else plan["bid_qty"]),
-                    (plan.ask_qty if self.strategy.upgraded else plan["ask_qty"]),
-                    1e-9,
-                ), 0.0),
+                quote_notional_usd=quote_notional_for_cost,
             )
             decision = self.decision_policy.evaluate(decision_input)
             self.analytics.record_decision(

@@ -50,7 +50,7 @@ class SelfCalibrator:
         min_ofi_skew: float = 0.3,
         max_edge_bps: float = 25.0,
         min_edge_bps: float = 0.5,
-        min_fills_for_policy_update: int = 25,
+        min_fills_for_policy_update: int = 12,
     ) -> None:
         self.as_gamma = initial_gamma
         self.ofi_skew_bps = initial_ofi_skew_bps
@@ -139,7 +139,11 @@ class SelfCalibrator:
             self.ofi_skew_bps = max(self.min_ofi_skew, self.ofi_skew_bps * (1 - self.step_size))
 
         if policy is not None and outcomes and len(outcomes) >= self.min_fills_for_policy_update:
-            artifact = calibrate_policy_from_outcomes(outcomes, output_dir=artifact_dir)
+            artifact = calibrate_policy_from_outcomes(
+                outcomes,
+                output_dir=artifact_dir,
+                min_samples_per_regime=6,
+            )
             policy.apply_artifact(artifact)
         elif policy is not None and outcomes is not None and len(outcomes) < self.min_fills_for_policy_update:
             logger.info(

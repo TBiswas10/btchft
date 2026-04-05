@@ -97,12 +97,21 @@ class CalibrationArtifact:
 
 class ExpectancyDecisionPolicy:
     DEFAULT_THRESHOLDS = {
-        "quiet": 0.12,
-        "normal": 0.20,
-        "trend": 0.35,
-        "high_vol": 0.55,
-        "warmup": 0.40,
-        "unknown": 0.40,
+        "quiet": 0.34,
+        "normal": 0.30,
+        "trend": 0.95,
+        "high_vol": 1.15,
+        "warmup": 0.60,
+        "unknown": 0.75,
+    }
+
+    REGIME_MIN_CONFIDENCE = {
+        "quiet": 0.45,
+        "normal": 0.18,
+        "trend": 0.55,
+        "high_vol": 0.60,
+        "warmup": 0.55,
+        "unknown": 0.55,
     }
 
     DEFAULT_FILL_PROB = {
@@ -113,11 +122,11 @@ class ExpectancyDecisionPolicy:
 
     def __init__(
         self,
-        base_threshold_bps: float = 1.5,
+        base_threshold_bps: float = 0.35,
         confidence_margin_bps: float = 0.15,
         toxicity_penalty_bps: float = 0.30,
         inventory_penalty_factor: float = 0.25,
-        min_confidence: float = 0.45,
+        min_confidence: float = 0.35,
         feature_prior_weight: float = 0.25,
         soft_gate_buffer_bps: float = 0.35,
         artifact: CalibrationArtifact | None = None,
@@ -170,18 +179,19 @@ class ExpectancyDecisionPolicy:
     def evaluate(self, inp: DecisionInput) -> TradeDecision:
         fill_prob = min(max(inp.estimated_fill_prob, 0.01), 0.99)
         confidence = self._confidence(inp)
+        required_confidence = self._required_confidence(inp.regime)
         threshold = self._threshold_for(inp.regime, confidence, inp.quote_notional_usd)
-        if confidence < self.min_confidence:
+        if confidence < required_confidence:
             near = threshold - post if (post := (fill_prob * inp.expected_capture_bps - inp.fee_bps - inp.slippage_bps - inp.adverse_selection_bps)) else threshold
-            if near <= self.soft_gate_buffer_bps and inp.regime in {"trend", "high_vol", "normal"}:
+            if near <= self.soft_gate_buffer_bps and inp.regime in {"trend", "high_vol", "normal", "quiet"}:
                 return TradeDecision(
                     should_trade=False,
                     expected_net_bps=post,
                     confidence=confidence,
                     threshold_used=threshold,
                     reason="low_signal_confidence_soft_gate",
-                    size_multiplier=0.35,
-                    spread_multiplier=1.30,
+                    size_multiplier=0.35 if inp.regime != "normal" else 0.50,
+                    spread_multiplier=1.30 if inp.regime != "normal" else 1.15,
                 )
             return TradeDecision(
                 should_trade=False,
@@ -204,6 +214,16 @@ class ExpectancyDecisionPolicy:
             - toxicity_penalty
         )
 
+        # Quiet regime remains heavily suppressed unless confidence and edge are both exceptional.
+        if inp.regime == "quiet":
+            quiet_edge_floor = threshold + 1.50
+            if confidence < 0.62 or post_cost <= quiet_edge_floor:
+                return TradeDecision(False, post_cost, confidence, threshold, "quiet_regime_hold_for_stronger_edge", 0.15, 1.45)
+
+        # Require stronger confirmation in unstable regimes to avoid over-trading.
+        if inp.regime in {"trend", "high_vol"} and confidence < 0.65 and post_cost <= threshold + 0.35:
+            return TradeDecision(False, post_cost, confidence, threshold, "strong_signal_required", 0.20, 1.40)
+
         if post_cost > threshold:
             size_mult = 1.0
             spread_mult = 1.0
@@ -216,15 +236,15 @@ class ExpectancyDecisionPolicy:
             return TradeDecision(True, post_cost, confidence, threshold, "post_cost_expectancy_ok", size_mult, spread_mult)
 
         near_threshold = threshold - post_cost
-        if near_threshold <= self.soft_gate_buffer_bps and confidence >= max(0.35, self.min_confidence - 0.15):
+        if near_threshold <= self.soft_gate_buffer_bps and confidence >= max(0.30, required_confidence - 0.10):
             return TradeDecision(
                 should_trade=False,
                 expected_net_bps=post_cost,
                 confidence=confidence,
                 threshold_used=threshold,
                 reason="soft_gate_reduce_size_widen",
-                size_multiplier=0.30,
-                spread_multiplier=1.35,
+                size_multiplier=0.40 if inp.regime == "normal" else 0.30,
+                spread_multiplier=1.20 if inp.regime == "normal" else 1.35,
             )
 
         reason = "post_cost_expectancy_below_threshold"
@@ -235,14 +255,40 @@ class ExpectancyDecisionPolicy:
     def _threshold_for(self, regime: str, confidence: float, quote_notional_usd: float) -> float:
         regime_floor = self._regime_thresholds.get(regime, self.base_threshold_bps)
         bucket_floor = self._bucket_thresholds.get(_notional_bucket(quote_notional_usd), self._bucket_thresholds["unknown"])
-        confidence_penalty = (1.0 - min(max(confidence, 0.0), 1.0)) * self.confidence_margin_bps
+        confidence_penalty_scale = {
+            "normal": 0.55,
+            "quiet": 1.00,
+            "trend": 1.25,
+            "high_vol": 1.35,
+        }.get(regime, 1.0)
+        confidence_penalty = (1.0 - min(max(confidence, 0.0), 1.0)) * self.confidence_margin_bps * confidence_penalty_scale
         floor = max(self.base_threshold_bps, regime_floor, bucket_floor)
         return floor + confidence_penalty
+
+    def _required_confidence(self, regime: str) -> float:
+        regime_floor = self.REGIME_MIN_CONFIDENCE.get(regime, self.min_confidence)
+        return max(self.min_confidence, regime_floor) if regime != "normal" else regime_floor
 
     def apply_artifact(self, artifact: CalibrationArtifact) -> None:
         self._artifact_version = artifact.version
         for regime, params in artifact.regime_params.items():
-            self._regime_thresholds[regime] = max(0.01, params.threshold_bps)
+            cap = {
+                "quiet": 0.60,
+                "normal": 0.40,
+                "trend": 1.30,
+                "high_vol": 1.50,
+                "warmup": 0.80,
+                "unknown": 1.00,
+            }.get(regime, 1.00)
+            floor = {
+                "quiet": 0.25,
+                "normal": 0.20,
+                "trend": 0.55,
+                "high_vol": 0.75,
+                "warmup": 0.35,
+                "unknown": 0.40,
+            }.get(regime, 0.20)
+            self._regime_thresholds[regime] = max(floor, min(params.threshold_bps, cap))
             self._regime_adverse[regime] = max(0.0, params.adverse_selection_bps)
             self._regime_slippage[regime] = max(0.0, params.slippage_bps)
             if params.sample_count >= 5:
@@ -350,14 +396,23 @@ def calibrate_policy_from_outcomes(
             threshold = max(best_threshold, 0.01)
 
         regime_cap = {
-            "quiet": 2.0,
-            "normal": 2.5,
-            "trend": 3.0,
-            "high_vol": 3.0,
-            "warmup": 1.5,
-            "unknown": 2.0,
-        }.get(regime, 2.5)
+            "quiet": 0.60,
+            "normal": 0.40,
+            "trend": 1.30,
+            "high_vol": 1.50,
+            "warmup": 0.80,
+            "unknown": 1.00,
+        }.get(regime, 1.0)
+        regime_floor = {
+            "quiet": 0.25,
+            "normal": 0.20,
+            "trend": 0.55,
+            "high_vol": 0.75,
+            "warmup": 0.35,
+            "unknown": 0.40,
+        }.get(regime, 0.20)
         threshold = min(threshold, regime_cap)
+        threshold = max(threshold, regime_floor)
 
         params[regime] = RegimeCalibration(
             threshold_bps=round(float(threshold), 6),
@@ -381,19 +436,50 @@ def calibrate_policy_from_outcomes(
             threshold = max(min(expected), 0.01) if mean(realized) > 0 else max(mean(expected), 0.05)
         bucket = key.split("|")[-1] if "|" in key else key
         bucket_cap = {
-            "micro": 1.5,
-            "small": 2.0,
-            "medium": 2.5,
-            "large": 3.0,
-            "unknown": 2.0,
-        }.get(bucket, 2.0)
+            "micro": 0.55,
+            "small": 0.75,
+            "medium": 0.95,
+            "large": 1.15,
+            "unknown": 0.80,
+        }.get(bucket, 0.8)
         threshold = min(threshold, bucket_cap)
+        threshold = max(threshold, 0.08)
         bucket_params[key] = RegimeCalibration(
             threshold_bps=round(float(threshold), 6),
             fill_prob=round(float(mean(s.fill_prob for s in samples)), 6),
             adverse_selection_bps=round(float(mean(s.adverse_selection_bps for s in samples)), 6),
             slippage_bps=round(float(mean(s.slippage_bps for s in samples)), 6),
             sample_count=len(samples),
+        )
+
+    global_fill = mean(r.fill_prob for r in rows) if rows else 0.45
+    global_slippage = mean(r.slippage_bps for r in rows) if rows else 0.20
+    global_adverse = mean(r.adverse_selection_bps for r in rows) if rows else 0.20
+    regime_defaults = {
+        "quiet": 0.34,
+        "normal": 0.30,
+        "trend": 0.95,
+        "high_vol": 1.15,
+        "warmup": 0.60,
+        "unknown": 0.75,
+    }
+    regime_fill_adj = {
+        "quiet": 1.00,
+        "normal": 0.95,
+        "trend": 0.85,
+        "high_vol": 0.75,
+        "warmup": 0.80,
+        "unknown": 0.85,
+    }
+    for regime, default_threshold in regime_defaults.items():
+        if regime in params:
+            continue
+        params[regime] = RegimeCalibration(
+            threshold_bps=default_threshold,
+            fill_prob=max(0.05, min(0.95, global_fill * regime_fill_adj.get(regime, 0.9))),
+            adverse_selection_bps=global_adverse,
+            slippage_bps=global_slippage,
+            sample_count=0,
         )
 
     version = datetime.now(timezone.utc).strftime("expectancy_%Y%m%d_%H%M%S")

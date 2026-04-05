@@ -1,0 +1,64 @@
+{
+  "version": "expectancy_20260405_085610",
+  "created_at": "2026-04-05T08:56:10.491067+00:00",
+  "regime_params": {
+    "quiet": {
+      "threshold_bps": 0.6,
+      "fill_prob": 0.777012,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.55992,
+      "sample_count": 40
+    },
+    "normal": {
+      "threshold_bps": 0.3,
+      "fill_prob": 0.7609559374999999,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.5215393585420134,
+      "sample_count": 0
+    },
+    "trend": {
+      "threshold_bps": 0.95,
+      "fill_prob": 0.6808553124999999,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.5215393585420134,
+      "sample_count": 0
+    },
+    "high_vol": {
+      "threshold_bps": 1.15,
+      "fill_prob": 0.6007546874999999,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.5215393585420134,
+      "sample_count": 0
+    },
+    "warmup": {
+      "threshold_bps": 0.6,
+      "fill_prob": 0.640805,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.5215393585420134,
+      "sample_count": 0
+    },
+    "unknown": {
+      "threshold_bps": 0.75,
+      "fill_prob": 0.6808553124999999,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.5215393585420134,
+      "sample_count": 0
+    }
+  },
+  "regime_bucket_params": {
+    "quiet|small": {
+      "threshold_bps": 0.542457,
+      "fill_prob": 0.798148,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.495629,
+      "sample_count": 21
+    },
+    "quiet|micro": {
+      "threshold_bps": 0.547943,
+      "fill_prob": 0.804166,
+      "adverse_selection_bps": 0.1,
+      "slippage_bps": 0.550177,
+      "sample_count": 19
+    }
+  }
+}

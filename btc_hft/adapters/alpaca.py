@@ -105,7 +105,7 @@ class AlpacaCryptoDataService:
                 age_seconds = (datetime.now(timezone.utc) - self.last_message_at).total_seconds()
 
             return {
-                "connected": bool(self.is_running),
+                "connected": bool(self.is_running and self._current_stream is not None),
                 "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
                 "data_age_seconds": age_seconds,
                 "last_error": self.last_error,

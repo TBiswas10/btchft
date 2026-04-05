@@ -22,7 +22,13 @@ from .models import PositionState, RuntimeState
 from .order_manager import FillResult, OrderManager
 from .portfolio import apply_fill_to_state, apply_funding_to_state, mark_to_market_unrealized_pnl
 from .analytics import PerformanceAnalytics
-from .decision_policy import DecisionInput, ExpectancyDecisionPolicy, TradeDecision, load_latest_calibration_artifact
+from .adaptive_expectancy_policy import (
+    AdaptiveExpectancyPolicy,
+    DecisionInput,
+    DecisionOutcome,
+    TradeDecision,
+    load_latest_calibration_artifact,
+)
 from .profit_controls import (
     AdverseSelectionGuard,
     ExecutionQualityMonitor,
@@ -107,19 +113,22 @@ class Bot:
         self._liquidation_mode: bool = False
         self.regime_detector = RegimeDetector(lookback=int(os.getenv("REGIME_LOOKBACK_TICKS", "40")))
         calibration_dir = self.settings.db_path.parent / "calibration"
-        legacy_edge = float(os.getenv("MIN_NET_EDGE_BPS", "1.5"))
-        base_threshold = float(os.getenv("EXPECTANCY_BASE_THRESHOLD_BPS", str(min(max(legacy_edge, 1.0), 3.0))))
+        legacy_edge = float(os.getenv("MIN_NET_EDGE_BPS", "0.35"))
+        base_threshold = float(os.getenv("EXPECTANCY_BASE_THRESHOLD_BPS", str(min(max(legacy_edge, 0.25), 1.25))))
         artifact = load_latest_calibration_artifact(calibration_dir)
         if artifact is not None:
-            base_threshold = min(base_threshold, 1.5)
-        self.decision_policy = ExpectancyDecisionPolicy(
+            base_threshold = min(base_threshold, 0.35)
+        self.decision_policy = AdaptiveExpectancyPolicy(
             base_threshold_bps=base_threshold,
             confidence_margin_bps=float(os.getenv("EXPECTANCY_CONF_MARGIN_BPS", "0.15")),
             toxicity_penalty_bps=float(os.getenv("EXPECTANCY_TOXICITY_PENALTY_BPS", "0.30")),
             inventory_penalty_factor=float(os.getenv("EXPECTANCY_INVENTORY_PENALTY", "0.25")),
-            min_confidence=float(os.getenv("EXPECTANCY_MIN_CONFIDENCE", "0.45")),
+            min_confidence=float(os.getenv("EXPECTANCY_MIN_CONFIDENCE", "0.35")),
             feature_prior_weight=float(os.getenv("EXPECTANCY_FEATURE_PRIOR_WEIGHT", "0.25")),
             soft_gate_buffer_bps=float(os.getenv("EXPECTANCY_SOFT_GATE_BUFFER_BPS", "0.35")),
+            calibration_dir=calibration_dir,
+            enforce_artifact_readiness=True,
+            min_artifacts_per_regime=2,
             artifact=artifact,
         )
         self.adverse_guard = AdverseSelectionGuard(
@@ -147,7 +156,6 @@ class Bot:
                 channel=os.getenv("ALERT_CHANNEL", "disabled"),
                 webhook_url=os.getenv("ALERT_WEBHOOK_URL", ""),
                 telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
-                    calibration_dir = self.settings.db_path.parent / "calibration"
                 telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
                 smtp_host=os.getenv("ALERT_SMTP_HOST", ""),
                 smtp_port=int(os.getenv("ALERT_SMTP_PORT", "587")),
@@ -159,6 +167,16 @@ class Bot:
         )
         self._last_dashboard_at: datetime | None = None
         self._last_restart_request_at: datetime | None = None
+        self._restart_backoff_attempts = 0
+        self._restart_min_interval_seconds = max(1.0, float(os.getenv("STREAM_RESTART_MIN_INTERVAL_SECONDS", "15")))
+        self._restart_max_interval_seconds = max(
+            self._restart_min_interval_seconds,
+            float(os.getenv("STREAM_RESTART_MAX_INTERVAL_SECONDS", "120")),
+        )
+        self._stale_breach_count = 0
+        self._stale_breach_required = max(1, int(os.getenv("STALE_BREACH_REQUIRED", "3")))
+        self._startup_stale_grace_seconds = max(0.0, float(os.getenv("STARTUP_STALE_GRACE_SECONDS", "45")))
+        self._started_at = datetime.now(timezone.utc)
         self._order_decisions: dict[str, dict] = {}
         self._pending_decision_context: dict | None = None
         self._last_decision: TradeDecision | None = None
@@ -312,6 +330,21 @@ class Bot:
             adverse_selection_bps=adverse_bps,
             expected_fill_prob=expected_fill_prob,
             quote_notional_usd=notional,
+        )
+        self.decision_policy.observe_outcome(
+            DecisionOutcome(
+                regime=str(decision_ctx.get("decision_regime", self._current_regime)) if isinstance(decision_ctx, dict) else self._current_regime,
+                queue_position=str(decision_ctx.get("queue_position", "unknown")) if isinstance(decision_ctx, dict) else "unknown",
+                expected_net_bps=expected_net_bps,
+                realized_net_bps=realized_net_bps,
+                expected_capture_bps=spread_capture,
+                fill_prob=expected_fill_prob,
+                confidence=confidence,
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                adverse_selection_bps=adverse_bps,
+                quote_notional_usd=notional,
+            )
         )
         self._last_fill_side = fill.side
         self._last_fill_price = fill.price
@@ -481,10 +514,48 @@ class Bot:
         apply_funding_to_state(self.state, mid, self.settings.funding_rate_bps_per_hour, now)
 
     def _maybe_restart_market(self, now: datetime, reason: str) -> None:
-        if self._last_restart_request_at is not None and (now - self._last_restart_request_at).total_seconds() < 15:
+        restart_interval_seconds = min(
+            self._restart_min_interval_seconds * (2 ** self._restart_backoff_attempts),
+            self._restart_max_interval_seconds,
+        )
+        if self._last_restart_request_at is not None and (now - self._last_restart_request_at).total_seconds() < restart_interval_seconds:
             return
         self._last_restart_request_at = now
+        self._restart_backoff_attempts += 1
         self.market.request_restart(reason)
+
+    def _reset_restart_backoff_if_healthy(self, data_age: float, stream_health: dict | None) -> None:
+        if not isinstance(stream_health, dict):
+            return
+        if not bool(stream_health.get("connected", False)):
+            return
+        if data_age > max(1.0, self.settings.stale_data_seconds / 2):
+            return
+        self._restart_backoff_attempts = 0
+
+    def _should_treat_stale_as_recoverable_issue(self, now: datetime, data_age: float, stream_health: dict | None) -> bool:
+        if data_age <= float(self.settings.stale_data_seconds):
+            self._stale_breach_count = 0
+            return False
+
+        # During startup grace, allow the stream to settle before first stale restart.
+        uptime_seconds = (now - self._started_at).total_seconds()
+        if uptime_seconds < self._startup_stale_grace_seconds:
+            return False
+
+        connected = bool(stream_health.get("connected", False)) if isinstance(stream_health, dict) else False
+        if not connected:
+            # If the stream is explicitly disconnected, use immediate recoverable restart path.
+            self._stale_breach_count = self._stale_breach_required
+            return True
+
+        # Require consecutive stale breaches to avoid restart thrash on intermittent quote gaps.
+        self._stale_breach_count += 1
+        return self._stale_breach_count >= self._stale_breach_required
+
+    @staticmethod
+    def _is_recoverable_stream_issue(reason: str | None) -> bool:
+        return reason in {"auto_stop_stale_feed", "auto_stop_stream_disconnected"}
 
     def _cancel_all_pending_orders(self) -> None:
         self.bid_orders.cancel_pending()
@@ -583,6 +654,7 @@ class Bot:
                 elif isinstance(stream_health, dict) and stream_health.get("last_message_at") is None:
                     # Warmup phase: no quote message received yet.
                     data_age = 0.0
+                self._reset_restart_backoff_if_healthy(data_age, stream_health)
                 dashboard_signal_text = "hold"
                 regime = self.regime_detector.update(quote.mid)
                 self._current_regime = regime.regime if hasattr(regime, "regime") else "unknown"
@@ -637,6 +709,28 @@ class Bot:
                 if self.auto_ops_enabled:
                     health_decision = self.auto_ops.check_health(data_age, stream_health)
                     if health_decision.should_stop:
+                        if health_decision.reason == "auto_stop_stale_feed":
+                            if not self._should_treat_stale_as_recoverable_issue(now, data_age, stream_health):
+                                self._render_dashboard(quote.mid, data_age, dashboard_signal_text)
+                                self._record_loop_latency(loop_start_ns, perf_counter_ns())
+                                time.sleep(self.runtime_loop_interval_seconds)
+                                continue
+                        if self._is_recoverable_stream_issue(health_decision.reason):
+                            self._cancel_all_pending_orders()
+                            self._maybe_restart_market(now, health_decision.reason or "stream_health_issue")
+                            self._log_event(
+                                "stream_restart_requested",
+                                {
+                                    "reason": health_decision.reason,
+                                    "data_age": data_age,
+                                    "stream_health": stream_health,
+                                },
+                            )
+                            self._render_dashboard(quote.mid, data_age, dashboard_signal_text)
+                            self._record_loop_latency(loop_start_ns, perf_counter_ns())
+                            time.sleep(self.runtime_loop_interval_seconds)
+                            continue
+
                         self._log_event(
                             "auto_ops_stop",
                             {
@@ -732,10 +826,6 @@ class Bot:
 
                 if data_age > self.settings.stale_data_seconds:
                     self._cancel_all_pending_orders()
-                    if self.auto_ops_enabled:
-                        self._log_event("auto_ops_stop", {"reason": "stale_data", "data_age": data_age})
-                        self._running = False
-                        break
                     self._maybe_restart_market(now, "stale_data")
                     self._log_event("stream_restart_requested", {"reason": "stale_data", "data_age": data_age})
                     self._render_dashboard(quote.mid, data_age, dashboard_signal_text)
@@ -832,16 +922,23 @@ class Bot:
                     dashboard_signal_text = "no_quote"
                 else:
                     expected_capture_bps = plan.half_spread_bps * max(self.edge_capture_multiplier, 0.1)
-                    fee_bps = self.edge_fee_bps
                     quote_notional = quote.mid * max(max(plan.bid_qty, plan.ask_qty), 1e-9)
                     modeled_notional = max(quote_notional, self.slippage_notional_floor_usd)
-                    slippage_bps = (self.max_avg_slippage_usd / max(modeled_notional, 1e-9)) * 10000.0
-                    adverse_penalty_bps = 0.8 if regime.regime in {"trend", "high_vol"} else 0.2
-                    fill_prob = self.decision_policy.estimate_fill_probability(
+                    fallback_slippage_bps = (self.max_avg_slippage_usd / max(modeled_notional, 1e-9)) * 10000.0
+                    fallback_adverse_bps = 0.8 if regime.regime in {"trend", "high_vol"} else 0.2
+                    empirical_cost = self.decision_policy.estimate_empirical_costs(
                         regime=regime.regime,
                         queue_position=ms.queue_position if ms is not None else "unknown",
+                        quote_notional_usd=modeled_notional,
+                        maker_fee_bps=self.edge_fee_bps,
+                        fallback_slippage_bps=fallback_slippage_bps,
+                        fallback_adverse_bps=fallback_adverse_bps,
                         observed_fill_rate=metrics.fill_ratio,
                     )
+                    fee_bps = empirical_cost.fee_bps
+                    slippage_bps = empirical_cost.slippage_bps
+                    adverse_penalty_bps = empirical_cost.adverse_selection_bps
+                    fill_prob = empirical_cost.fill_prob
                     uncertainty = min(
                         max(
                             regime.uncertainty,
@@ -880,8 +977,13 @@ class Bot:
                     self._last_decision = edge_decision
                     self._last_decision_context = {
                         "expected_net_bps": edge_decision.expected_net_bps,
+                        "expected_post_cost_edge_bps": edge_decision.expected_net_bps,
                         "confidence": edge_decision.confidence,
+                        "signal_confidence": self.decision_policy.signal_confidence(decision_input),
                         "threshold_used": edge_decision.threshold_used,
+                        "adaptive_threshold": edge_decision.threshold_used,
+                        "decision_regime": regime.regime,
+                        "queue_position": ms.queue_position if ms is not None else "unknown",
                         "size_multiplier": edge_decision.size_multiplier,
                         "spread_multiplier": edge_decision.spread_multiplier,
                         "fee_bps": fee_bps,

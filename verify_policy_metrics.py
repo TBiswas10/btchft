@@ -47,18 +47,28 @@ def _print_table(title: str, headers: list[str], rows: list[list[object]]) -> No
     print()
 
 
-def _regime_check(regime: str, avg_pred: float, avg_realized: float | None, trade_count: int, decision_count: int) -> str:
+def _regime_check(
+    regime: str,
+    avg_pred: float,
+    avg_realized: float | None,
+    trade_count: int,
+    decision_count: int,
+    signal_count: int,
+) -> str:
     trade_rate = (trade_count / decision_count) if decision_count else 0.0
+    signal_rate = (signal_count / decision_count) if decision_count else 0.0
     if regime in {"quiet", "high_vol"}:
-        if trade_rate <= 0.02:
+        if signal_rate <= 0.02:
             return "PASS suppressed"
         return "WARN active_when_should_be_suppressed"
 
     if avg_pred > 0.05:
-        if trade_count == 0:
+        if signal_count == 0:
             return "FAIL positive_expectancy_but_no_trades"
         if avg_realized is not None and avg_realized > 0:
             return "PASS positive_regime_trading"
+        if trade_count == 0:
+            return "WARN signaled_but_no_fills"
         return "WARN traded_but_non_positive_realized"
 
     if trade_rate <= 0.05:
@@ -136,6 +146,9 @@ def run(args: argparse.Namespace) -> int:
         rows = [r for r in per_timestamp_rows if r["regime"] == regime]
         pred_vals = [float(r["predicted_edge_bps"]) for r in rows]
         realized_vals = [float(r["realized_pnl_usd"]) for r in rows if r["realized_pnl_usd"] is not None]
+        regime_corr_x = [float(r["predicted_edge_bps"]) for r in rows if r["realized_pnl_usd"] is not None]
+        regime_corr_y = [float(r["realized_pnl_usd"]) for r in rows if r["realized_pnl_usd"] is not None]
+        should_trade_count = sum(1 for r in rows if r["should_trade"])
 
         for r in rows:
             if r["realized_pnl_usd"] is not None:
@@ -146,6 +159,7 @@ def run(args: argparse.Namespace) -> int:
         std_pred = _safe_std(pred_vals)
         avg_realized = mean(realized_vals) if realized_vals else None
         std_realized = _safe_std(realized_vals)
+        regime_corr = _safe_corr(regime_corr_x, regime_corr_y)
         trades_executed = trade_count_by_regime.get(regime, 0)
 
         summary_rows.append(
@@ -156,6 +170,8 @@ def run(args: argparse.Namespace) -> int:
                 f"{std_pred:.6f}",
                 "n/a" if avg_realized is None else f"{avg_realized:.6f}",
                 "n/a" if avg_realized is None else f"{std_realized:.6f}",
+                f"{regime_corr:.6f}",
+                should_trade_count,
                 trades_executed,
             ]
         )
@@ -165,7 +181,7 @@ def run(args: argparse.Namespace) -> int:
                 regime,
                 trades_executed,
                 len(rows),
-                _regime_check(regime, avg_pred, avg_realized, trades_executed, len(rows)),
+                _regime_check(regime, avg_pred, avg_realized, trades_executed, len(rows), should_trade_count),
             ]
         )
 
@@ -189,6 +205,8 @@ def run(args: argparse.Namespace) -> int:
             "std_predicted_edge_bps",
             "avg_realized_pnl_usd",
             "std_realized_pnl_usd",
+            "corr_pred_edge_vs_realized_pnl",
+            "signals_should_trade",
             "total_trades_executed",
         ],
         summary_rows,
@@ -269,7 +287,7 @@ def run(args: argparse.Namespace) -> int:
                 plt.show()
 
             regime_names = [row[0] for row in summary_rows]
-            regime_trades = [int(row[6]) for row in summary_rows]
+            regime_trades = [int(row[8]) for row in summary_rows]
             plt.figure(figsize=(7, 4))
             plt.bar(regime_names, regime_trades)
             plt.title("Trades Executed per Regime")
