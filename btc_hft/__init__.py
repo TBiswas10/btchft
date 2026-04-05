@@ -6,4 +6,9 @@ __all__ = [
     "database",
     "reporting",
     "latency",
+    "microstructure",
+    "analytics",
+    "self_calibration",
+    "spread_surface",
+    "backtest",
 ]

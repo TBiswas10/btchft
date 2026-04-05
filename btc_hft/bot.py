@@ -16,10 +16,12 @@ from .auto_ops import AutoOpsGuard
 from .config import Settings
 from .database import Database
 from .latency import LocalOrderBookEngine
+from .microstructure import MicrostructureEngine, MicrostructureSnapshot
 from .market_maker import AlwaysOnMarketMaker
 from .models import PositionState, RuntimeState
 from .order_manager import FillResult, OrderManager
 from .portfolio import apply_fill_to_state, apply_funding_to_state, mark_to_market_unrealized_pnl
+from .analytics import PerformanceAnalytics
 from .profit_controls import (
     AdverseSelectionGuard,
     ExecutionQualityMonitor,
@@ -27,9 +29,11 @@ from .profit_controls import (
     RegimeDetector,
     build_pnl_attribution,
 )
+from .self_calibration import SelfCalibrator
 from .reporting import write_end_of_day_report
 from .risk import RiskEngine
 from .session import SessionGuard
+from .spread_surface import SpreadSurface
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +59,16 @@ class Bot:
         
         self.bid_orders = OrderManager(self.trading, dry_run=settings.dry_run)
         self.ask_orders = OrderManager(self.trading, dry_run=settings.dry_run)
-        self.market_maker = AlwaysOnMarketMaker(settings)
+        self.spread_surface = SpreadSurface(
+            as_gamma=float(os.getenv("AS_GAMMA", "0.1")),
+            as_kappa=float(os.getenv("AS_KAPPA", "1.5")),
+            vol_factor=float(os.getenv("SPREAD_VOL_FACTOR", "0.4")),
+            inventory_factor=float(os.getenv("SPREAD_INVENTORY_FACTOR", "1.2")),
+            ofi_factor=float(os.getenv("SPREAD_OFI_FACTOR", "0.8")),
+            min_bps=float(os.getenv("SPREAD_MIN_BPS", "1.5")),
+            max_bps=float(os.getenv("SPREAD_MAX_BPS", "25.0")),
+        )
+        self.market_maker = AlwaysOnMarketMaker(settings, self.spread_surface)
         self.risk = RiskEngine(settings)
         self.session = SessionGuard(settings)
         self.fast_mode_enabled = os.getenv("FAST_MODE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -66,10 +79,35 @@ class Bot:
         self.local_book = LocalOrderBookEngine(symbol=self.settings.trading_symbol)
         self.loop_latency_us: deque[float] = deque(maxlen=500)
         self._last_latency_report_at: datetime | None = None
+        self.ms_engine = MicrostructureEngine(
+            ofi_window=int(os.getenv("OFI_WINDOW", "50")),
+            vol_span=int(os.getenv("EWMA_VOL_SPAN", "20")),
+            prior_toxic=float(os.getenv("BAYES_TOXIC_PRIOR", "0.2")),
+            toxic_threshold=float(os.getenv("BAYES_TOXIC_THRESHOLD", "0.70")),
+            update_strength=float(os.getenv("BAYES_UPDATE_STRENGTH", "0.15")),
+            queue_fast_ms=float(os.getenv("QUEUE_FILL_FAST_MS", "800")),
+            queue_slow_ms=float(os.getenv("QUEUE_FILL_SLOW_MS", "4000")),
+        )
+        self.analytics = PerformanceAnalytics(window=int(os.getenv("ANALYTICS_WINDOW", "300")))
+        self._self_cal_enabled = os.getenv("SELF_CAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        self._self_cal_every_n = int(os.getenv("SELF_CAL_EVERY_N_FILLS", "500"))
+        self.calibrator = SelfCalibrator(
+            initial_gamma=float(os.getenv("AS_GAMMA", "0.1")),
+            initial_ofi_skew_bps=float(os.getenv("OFI_SKEW_BPS", "1.5")),
+            initial_min_edge_bps=float(os.getenv("MIN_NET_EDGE_BPS", "12.0")),
+            step_size=float(os.getenv("SELF_CAL_STEP_SIZE", "0.05")),
+            max_gamma=float(os.getenv("SELF_CAL_MAX_GAMMA", "0.5")),
+            min_gamma=float(os.getenv("SELF_CAL_MIN_GAMMA", "0.02")),
+        )
+        self._last_ms: MicrostructureSnapshot | None = None
+        self._last_fill_side: str | None = None
+        self._last_fill_price: float | None = None
+        self._current_regime: str = "unknown"
+        self._liquidation_mode: bool = False
         self.regime_detector = RegimeDetector(lookback=int(os.getenv("REGIME_LOOKBACK_TICKS", "40")))
-        self.edge_gate = NetEdgeGate(min_net_edge_bps=float(os.getenv("MIN_NET_EDGE_BPS", "0.35")))
+        self.edge_gate = NetEdgeGate(min_net_edge_bps=float(os.getenv("MIN_NET_EDGE_BPS", "12.0")))
         self.adverse_guard = AdverseSelectionGuard(
-            move_bps_threshold=float(os.getenv("ADVERSE_MOVE_BPS", "6.0")),
+            move_bps_threshold=float(os.getenv("ADVERSE_MOVE_BPS", "4.0")),
             cooldown_seconds=int(os.getenv("ADVERSE_COOLDOWN_SECONDS", "2")),
         )
         self.exec_quality = ExecutionQualityMonitor()
@@ -117,6 +155,10 @@ class Bot:
         self.db.log_event(ts, event_type, payload)
         if event_type == "order_rejected":
             self.exec_quality.on_rejected()
+        if event_type == "net_edge_block":
+            self.analytics.record_edge_block()
+        if event_type == "toxicity_veto":
+            self.analytics.record_toxicity_veto()
         if event_type in {"risk_block", "stream_restart_requested", "order_rejected", "auto_ops_stop"}:
             self._emit_alert(f"BTC HFT Alert: {event_type}", str(payload))
 
@@ -203,6 +245,21 @@ class Bot:
                     },
                 )
                 self._running = False
+
+        current_mid = self.state.last_quote.mid or fill.price
+        self.ms_engine.on_fill(side=fill.side, fill_price=fill.price, subsequent_mid=current_mid)
+        spread_capture = impact.realized_pnl_usd + impact.fee_usd + impact.slippage_usd
+        self.analytics.record_fill(
+            realized_pnl=impact.realized_pnl_usd,
+            spread_capture=spread_capture,
+            ofi_score=self._last_ms.ofi_score if self._last_ms else 0.0,
+            regime=self._current_regime,
+            vol_bps=self._last_ms.vol_bps if self._last_ms else 0.0,
+            queue_position=self._last_ms.queue_position if self._last_ms else "unknown",
+            side=fill.side,
+        )
+        self._last_fill_side = fill.side
+        self._last_fill_price = fill.price
 
     def _entry_limit_price(self, side: str, bid: float, ask: float) -> float:
         offset = self.settings.order_price_offset_bps / 10000
@@ -304,6 +361,39 @@ class Bot:
         )
         print(f"Stream health: {self.market.health_snapshot()}")
 
+    def _log_heartbeat(self, quote: object, regime: object, ms: MicrostructureSnapshot | None, stream_health: dict[str, object]) -> None:
+        heartbeat_payload = {
+            "event": "heartbeat",
+            "symbol": self.settings.symbol,
+            "price": getattr(quote, "mid", 0.0),
+            "bid": getattr(quote, "bid", 0.0),
+            "ask": getattr(quote, "ask", 0.0),
+            "quote_timestamp": getattr(quote, "timestamp", None),
+            "reason": self.state.blocked_reason,
+            "stream_health": stream_health,
+            "book_mid": self.local_book.mid_price(),
+            "book_spread_bps": self.local_book.spread_bps(),
+            "regime": getattr(regime, "regime", "unknown"),
+            "volatility_bps": getattr(regime, "volatility_bps", 0.0),
+            "ofi_score": ms.ofi_score if ms else 0.0,
+            "ofi_strength": ms.ofi_signal_strength if ms else "unknown",
+            "momentum_composite_bps": ms.momentum.composite_bps if ms else 0.0,
+            "queue_position": ms.queue_position if ms else "unknown",
+            "queue_latency_ms": ms.queue_avg_latency_ms if ms else 0.0,
+            "p_toxic": ms.bayes_p_toxic if ms else 0.0,
+            "bayes_regime": ms.bayes_regime if ms else "unknown",
+            "liquidation_mode": self._liquidation_mode,
+            "calibrator_gamma": self.calibrator.as_gamma,
+            "calibrator_edge_bps": self.calibrator.min_net_edge_bps,
+            "analytics": self.analytics.snapshot(),
+        }
+
+        self.db.log_event(datetime.now(timezone.utc).isoformat(), "heartbeat", heartbeat_payload)
+        logger.info(
+            "Heartbeat",
+            extra=heartbeat_payload,
+        )
+
     def _should_exit(self, mid: float, now: datetime) -> tuple[bool, str]:
         pos = self.state.position
         if pos.qty_btc == 0 or pos.entry_time is None:
@@ -334,6 +424,11 @@ class Bot:
         self._last_restart_request_at = now
         self.market.request_restart(reason)
 
+    def _cancel_all_pending_orders(self) -> None:
+        self.bid_orders.cancel_pending()
+        self.ask_orders.cancel_pending()
+        self.ms_engine.on_cancel_or_replace()
+
     def _manage_quote_leg(self, side: str, manager: OrderManager, desired_price: float, desired_qty: float, now: datetime) -> None:
         if side == "sell":
             available_btc = self._sellable_btc()
@@ -351,6 +446,7 @@ class Bot:
             if ok:
                 order = manager.submit(side, desired_qty, desired_price)
                 if order is not None:
+                    self.ms_engine.on_order_submitted()
                     self.exec_quality.on_submitted()
                     self._log_event(
                         "quote_submitted",
@@ -375,8 +471,10 @@ class Bot:
 
         if price_drift_bps >= self.settings.market_maker_reprice_bps or age_seconds >= self.settings.order_reprice_seconds or qty_drift > 1e-9:
             replaced = manager.replace_pending(desired_price)
+            self.ms_engine.on_cancel_or_replace()
             self.exec_quality.on_canceled_or_replaced()
             if replaced is not None:
+                self.ms_engine.on_order_submitted()
                 self.exec_quality.on_submitted()
             self._log_event(
                 "quote_replaced",
@@ -408,7 +506,10 @@ class Bot:
                 now = datetime.now(timezone.utc)
                 quote = self.market.last_quote
                 stream_health = self.market.health_snapshot()
+                self.state.last_quote = quote
                 self._update_local_book(quote.bid, quote.ask)
+                ms = self.ms_engine.update(quote.bid, quote.ask)
+                self._last_ms = ms
                 data_age = (now - quote.timestamp).total_seconds()
                 stream_age = stream_health.get("data_age_seconds") if isinstance(stream_health, dict) else None
                 if isinstance(stream_age, (int, float)):
@@ -418,11 +519,32 @@ class Bot:
                     data_age = 0.0
                 dashboard_signal_text = "hold"
                 regime = self.regime_detector.update(quote.mid)
+                self._current_regime = regime.regime if hasattr(regime, "regime") else "unknown"
+
+                if self._self_cal_enabled:
+                    did_cal = self.calibrator.maybe_calibrate(
+                        fill_count=self.state.trade_count,
+                        every_n=self._self_cal_every_n,
+                        analytics=self.analytics.snapshot(),
+                    )
+                    if did_cal:
+                        self.spread_surface.as_gamma = self.calibrator.as_gamma
+                        self.edge_gate = NetEdgeGate(min_net_edge_bps=self.calibrator.min_net_edge_bps)
+                        self._log_event(
+                            "self_calibration_applied",
+                            {
+                                "gamma": self.calibrator.as_gamma,
+                                "ofi_skew_bps": self.calibrator.ofi_skew_bps,
+                                "edge_bps": self.calibrator.min_net_edge_bps,
+                            },
+                        )
+                elif not ms.should_liquidate and self._liquidation_mode:
+                    self._liquidation_mode = False
+                    self._log_event("liquidation_mode_exited", {"p_toxic": ms.bayes_p_toxic})
 
                 paused, pause_reason = self.adverse_guard.update_and_check(quote.mid, now)
                 if paused:
-                    self.bid_orders.cancel_pending()
-                    self.ask_orders.cancel_pending()
+                    self._cancel_all_pending_orders()
                     self._log_event("adverse_selection_pause", {"reason": pause_reason, "regime": regime.regime})
                     self._record_loop_latency(loop_start_ns, perf_counter_ns())
                     time.sleep(self.runtime_loop_interval_seconds)
@@ -457,8 +579,7 @@ class Bot:
                                 "stream_health": stream_health,
                             },
                         )
-                        self.bid_orders.cancel_pending()
-                        self.ask_orders.cancel_pending()
+                        self._cancel_all_pending_orders()
                         self._running = False
                         break
 
@@ -468,13 +589,20 @@ class Bot:
                         self.state,
                         self.settings.symbol,
                         stream_health,
+                        analytics_snapshot=self.analytics.snapshot(),
+                        calibration_state={
+                            "gamma": self.calibrator.as_gamma,
+                            "ofi_skew_bps": self.calibrator.ofi_skew_bps,
+                            "edge_bps": self.calibrator.min_net_edge_bps,
+                            "calibration_count": self.calibrator.state.calibration_count,
+                            "adjustment_log": self.calibrator.state.adjustment_log,
+                        },
                     )
                     self._log_event("daily_auto_report", {"path": str(daily)})
 
                 session_decision = self.session.evaluate(self.state, now)
                 if session_decision.should_stop:
-                    self.bid_orders.cancel_pending()
-                    self.ask_orders.cancel_pending()
+                    self._cancel_all_pending_orders()
                     self._log_event("session_stop", {"reason": session_decision.reason, "day": session_decision.session_day})
                     self._running = False
                     break
@@ -488,17 +616,46 @@ class Bot:
                 blocked, reason = self.risk.is_blocked(self.state, now, data_age)
                 self.state.blocked_reason = reason
                 if blocked:
-                    self.bid_orders.cancel_pending()
-                    self.ask_orders.cancel_pending()
+                    self._cancel_all_pending_orders()
                     self._log_event("risk_block", {"reason": reason, "state": asdict(self.state)})
                     self._render_dashboard(quote.mid, data_age, dashboard_signal_text)
+                    self._log_heartbeat(quote, regime, ms, stream_health)
+                    self._record_loop_latency(loop_start_ns, perf_counter_ns())
+                    time.sleep(self.runtime_loop_interval_seconds)
+                    continue
+
+                if self._liquidation_mode and self.state.position.qty_btc != 0:
+                    self._cancel_all_pending_orders()
+                    exit_side = "sell" if self.state.position.qty_btc > 0 else "buy"
+                    qty = self._sellable_btc() if exit_side == "sell" else abs(self.state.position.qty_btc)
+                    if qty > 0:
+                        if exit_side == "sell":
+                            price = quote.bid * 0.9998
+                        else:
+                            price = quote.ask * 1.0002
+                        signed_qty = -qty if exit_side == "sell" else qty
+                        ok, risk_reason = self.risk.check_new_order(self.state, signed_qty, price)
+                        if ok:
+                            mgr = self.ask_orders if exit_side == "sell" else self.bid_orders
+                            order = mgr.submit(exit_side, qty, price)
+                            if order is not None:
+                                self.ms_engine.on_order_submitted()
+                                self._log_event(
+                                    "liquidation_order_submitted",
+                                    {
+                                        "side": exit_side,
+                                        "qty": qty,
+                                        "price": price,
+                                        "p_toxic": ms.bayes_p_toxic,
+                                    },
+                                )
+                    self._render_dashboard(quote.mid, data_age, "LIQUIDATION")
                     self._record_loop_latency(loop_start_ns, perf_counter_ns())
                     time.sleep(self.runtime_loop_interval_seconds)
                     continue
 
                 if data_age > self.settings.stale_data_seconds:
-                    self.bid_orders.cancel_pending()
-                    self.ask_orders.cancel_pending()
+                    self._cancel_all_pending_orders()
                     if self.auto_ops_enabled:
                         self._log_event("auto_ops_stop", {"reason": "stale_data", "data_age": data_age})
                         self._running = False
@@ -540,8 +697,7 @@ class Bot:
 
                 exit_now, exit_reason = self._should_exit(quote.mid, now)
                 if exit_now and self.state.position.qty_btc != 0:
-                    self.bid_orders.cancel_pending()
-                    self.ask_orders.cancel_pending()
+                    self._cancel_all_pending_orders()
                     exit_side = "sell" if self.state.position.qty_btc > 0 else "buy"
                     if exit_side == "sell":
                         qty = self._sellable_btc()
@@ -569,29 +725,32 @@ class Bot:
                     time.sleep(self.runtime_loop_interval_seconds)
                     continue
 
-                plan = self.market_maker.build_plan(quote, self.state.position)
+                extra_inventory_skew = (
+                    self.settings.market_maker_inventory_skew_bps
+                    if ms is not None and abs(ms.ofi_score) >= self.inventory_accel_ratio
+                    else 0.0
+                )
+                ofi_score = (ms.ofi_score * self.calibrator.ofi_skew_bps) if ms is not None else 0.0
+                momentum_bps = (
+                    ms.momentum.composite_bps * float(os.getenv("AS_MOMENTUM_FACTOR", "0.3"))
+                    if ms is not None
+                    else 0.0
+                )
+                plan = self.market_maker.build_plan(
+                    quote,
+                    self.state.position,
+                    volatility_bps=regime.volatility_bps,
+                    regime=regime.regime,
+                    spread_multiplier=spread_multiplier,
+                    size_multiplier=size_multiplier,
+                    extra_inventory_skew_bps=extra_inventory_skew,
+                    ofi_score=ofi_score,
+                    momentum_bps=momentum_bps,
+                    queue_position=ms.queue_position if ms is not None else "unknown",
+                )
                 if plan is None:
                     dashboard_signal_text = "no_quote"
                 else:
-                    extra_inventory_skew = (
-                        self.settings.market_maker_inventory_skew_bps
-                        if abs(plan.inventory_ratio) >= self.inventory_accel_ratio
-                        else 0.0
-                    )
-                    plan = self.market_maker.build_plan(
-                        quote,
-                        self.state.position,
-                        volatility_bps=regime.volatility_bps,
-                        regime=regime.regime,
-                        spread_multiplier=spread_multiplier,
-                        size_multiplier=size_multiplier,
-                        extra_inventory_skew_bps=extra_inventory_skew,
-                    )
-                    if plan is None:
-                        self._record_loop_latency(loop_start_ns, perf_counter_ns())
-                        time.sleep(self.runtime_loop_interval_seconds)
-                        continue
-
                     gross_edge_bps = plan.half_spread_bps * max(self.edge_capture_multiplier, 0.1)
                     fee_bps = self.edge_fee_bps
                     quote_notional = quote.mid * max(max(plan.bid_qty, plan.ask_qty), 1e-9)
@@ -605,8 +764,7 @@ class Bot:
                         adverse_selection_bps=adverse_penalty_bps,
                     )
                     if not edge_decision.should_trade:
-                        self.bid_orders.cancel_pending()
-                        self.ask_orders.cancel_pending()
+                        self._cancel_all_pending_orders()
                         self._log_event(
                             "net_edge_block",
                             {
@@ -642,6 +800,17 @@ class Bot:
                         "book_spread_bps": self.local_book.spread_bps(),
                         "regime": regime.regime,
                         "volatility_bps": regime.volatility_bps,
+                        "ofi_score": ms.ofi_score if ms else 0.0,
+                        "ofi_strength": ms.ofi_signal_strength if ms else "unknown",
+                        "momentum_composite_bps": ms.momentum.composite_bps if ms else 0.0,
+                        "queue_position": ms.queue_position if ms else "unknown",
+                        "queue_latency_ms": ms.queue_avg_latency_ms if ms else 0.0,
+                        "p_toxic": ms.bayes_p_toxic if ms else 0.0,
+                        "bayes_regime": ms.bayes_regime if ms else "unknown",
+                        "liquidation_mode": self._liquidation_mode,
+                        "calibrator_gamma": self.calibrator.as_gamma,
+                        "calibrator_edge_bps": self.calibrator.min_net_edge_bps,
+                        "analytics": self.analytics.snapshot(),
                     },
                 )
                 self._record_loop_latency(loop_start_ns, perf_counter_ns())
@@ -653,6 +822,14 @@ class Bot:
                 self.state,
                 self.settings.symbol,
                 self.market.health_snapshot(),
+                analytics_snapshot=self.analytics.snapshot(),
+                calibration_state={
+                    "gamma": self.calibrator.as_gamma,
+                    "ofi_skew_bps": self.calibrator.ofi_skew_bps,
+                    "edge_bps": self.calibrator.min_net_edge_bps,
+                    "calibration_count": self.calibrator.state.calibration_count,
+                    "adjustment_log": self.calibrator.state.adjustment_log,
+                },
             )
             logger.info("Bot stopped", extra={"event": "bot_stopped", "reason": "shutdown"})
             logger.info("Report generated", extra={"event": "eod_report", "reason": str(report)})

@@ -8,7 +8,14 @@ from pathlib import Path
 from .models import RuntimeState
 
 
-def write_end_of_day_report(report_dir: Path, state: RuntimeState, symbol: str, stream_health: dict | None = None) -> Path:
+def write_end_of_day_report(
+    report_dir: Path,
+    state: RuntimeState,
+    symbol: str,
+    stream_health: dict | None = None,
+    analytics_snapshot: dict | None = None,
+    calibration_state: dict | None = None,
+) -> Path:
     report_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
 
@@ -36,6 +43,8 @@ def write_end_of_day_report(report_dir: Path, state: RuntimeState, symbol: str, 
         "final_position": asdict(state.position),
         "blocked_reason": state.blocked_reason,
         "stream_health": stream_health,
+        "analytics": analytics_snapshot or {},
+        "calibration": calibration_state or {},
     }
 
     target = report_dir / f"eod_report_{now.strftime('%Y%m%d_%H%M%S')}.json"

@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any
 
 
+_STANDARD_LOG_RECORD_KEYS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys())
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -15,9 +18,8 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for key in ("event", "symbol", "side", "qty", "price", "reason", "order_id", "client_order_id"):
-            value = getattr(record, key, None)
-            if value is not None:
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD_LOG_RECORD_KEYS and key not in payload and value is not None:
                 payload[key] = value
         return json.dumps(payload, default=str)
 

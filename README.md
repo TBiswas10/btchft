@@ -19,6 +19,39 @@ structured logging, SQLite persistence, and end-of-day report generation.
 - Writes end-of-day JSON report at shutdown.
 - Shows a simple live terminal dashboard for position and PnL.
 
+## Strategy engine v2
+
+This system implements two professional quant strategies in a unified architecture:
+
+### 1. Market making - Avellaneda-Stoikov with spread surface
+The spread is a continuous function of volatility, inventory, OFI, regime,
+and queue position - not a fixed parameter. The A-S model is extended with
+a momentum drift term that adjusts the reservation price when BTC trends.
+
+### 2. HFT microstructure intelligence
+- Order flow imbalance (OFI): infers buy/sell pressure from quote dynamics
+- Momentum signal: 3/10/30 tick composite momentum adjusts reservation price
+- Queue position inference: tracks fill latency to infer queue depth
+- Bayesian regime detector: maintains P(toxic) belief, switches to liquidation mode
+
+### 3. Self-calibrating parameter loop
+Every 500 fills, the system evaluates rolling Sharpe and fill rate, then
+nudges as_gamma, ofi_skew_bps, and min_net_edge_bps toward higher-performing
+regions. The bot improves itself while running.
+
+### 4. Liquidation mode
+When Bayesian P(toxic) > 0.70, the bot switches from market-making to
+aggressive inventory liquidation - one-sided quoting near the bid/ask to
+exit positions before being further adversely selected.
+
+### Parameter changes from v1
+| Parameter               | Old     | New   | Reason                           |
+|-------------------------|---------|-------|----------------------------------|
+| MIN_NET_EDGE_BPS        | 0.35    | 12.0  | Below Alpaca fee floor           |
+| TARGET_SPREAD_BPS       | 8.0     | N/A   | Replaced by spread surface       |
+| ORDER_SIZE_BTC          | 0.001   | 0.005 | Fees dominated at $85 notional   |
+| ADVERSE_MOVE_BPS        | 6.0     | 4.0   | Faster adverse flow detection    |
+
 ## Quick start (from repository root)
 
 1. Create a virtual environment and install dependencies:

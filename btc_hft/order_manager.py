@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import uuid
 
 from .alpaca_clients import ManagedOrder, TradingService
+from .models import QuoteSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +64,37 @@ class OrderManager:
         self.pending = managed
         return managed
 
-    def reconcile(self) -> list[FillResult]:
+    def reconcile(self, current_quote: QuoteSnapshot | None = None) -> list[FillResult]:
         if not self.pending:
             return []
 
         if self.dry_run:
+            side = self.pending.side
+            limit_price = self.pending.limit_price
+            if current_quote is not None and current_quote.bid > 0 and current_quote.ask > 0:
+                marketable = (
+                    side == "buy" and current_quote.ask <= limit_price
+                ) or (
+                    side == "sell" and current_quote.bid >= limit_price
+                )
+                if not marketable:
+                    return []
+                if side == "buy":
+                    base_fill_price = min(limit_price, current_quote.ask)
+                else:
+                    base_fill_price = max(limit_price, current_quote.bid)
+            else:
+                base_fill_price = limit_price
+
+            slippage_bps = max(0.0, random.gauss(mu=0.5, sigma=0.3))
+            if side == "buy":
+                fill_price = base_fill_price * (1 + slippage_bps / 10000.0)
+            else:
+                fill_price = base_fill_price * (1 - slippage_bps / 10000.0)
             fill = FillResult(
                 side=self.pending.side,
                 qty=self.pending.qty,
-                price=self.pending.limit_price,
+                price=fill_price,
                 order_id=self.pending.order_id,
                 client_order_id=self.pending.client_order_id,
                 limit_price=self.pending.limit_price,
